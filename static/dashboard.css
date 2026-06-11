@@ -29,6 +29,12 @@ body {
   color: #c6d4df;
 }
 
+.timezone-note {
+  margin: 0.3rem 0 0;
+  color: #9eb2c3;
+  font-size: 0.88rem;
+}
+
 .page {
   padding: 1.25rem;
 }
@@ -72,6 +78,69 @@ body {
 .muted {
   margin-top: 0.35rem;
   color: #667788;
+}
+
+.actions-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.actions-list {
+  display: grid;
+  gap: 0.6rem;
+  margin-top: 0.25rem;
+}
+
+.action-button {
+  border: 0;
+  border-radius: 10px;
+  padding: 0.7rem 0.9rem;
+  font-size: 0.92rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: transform 120ms ease, opacity 120ms ease;
+}
+
+.action-button:hover:not(:disabled) {
+  transform: translateY(-1px);
+}
+
+.action-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.action-neutral {
+  background: #dbe9f5;
+  color: #163a59;
+}
+
+.action-primary {
+  background: #1f6fb2;
+  color: #f7fbff;
+}
+
+.action-warning {
+  background: #fff1c7;
+  color: #7a5400;
+}
+
+.action-danger {
+  background: #ffd9d9;
+  color: #8f1f1f;
+}
+
+.message-good {
+  color: #116b37;
+}
+
+.message-warning {
+  color: #8a5a00;
+}
+
+.message-critical {
+  color: #9c1b1b;
 }
 
 .panel {

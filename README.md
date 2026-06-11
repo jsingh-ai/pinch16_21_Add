@@ -78,6 +78,16 @@ http://localhost:5050
 
 The dashboard reads only from SQLite and does not connect to OPC UA directly. It refreshes every 15 seconds and exposes a JSON status API at `/api/status`.
 
+Timestamps remain stored in UTC in SQLite, but the dashboard displays them in US Central time for operators.
+
+### Dashboard Maintenance Actions
+
+The dashboard includes maintenance buttons for running retention cleanup and clearing monitoring data. Run the dashboard only on a trusted internal network because those controls can trigger cleanup actions.
+
+- `Run cleanup now` calls the same retention cleanup used by the collector.
+- `Clear poll runs`, `Clear bad samples`, and `Clear monitoring data` require confirmation in the browser.
+- These dashboard maintenance actions do not delete `machines` or `tags`.
+
 ## Data Retention And Cleanup
 
 By default:

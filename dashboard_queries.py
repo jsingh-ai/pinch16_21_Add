@@ -5,6 +5,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from config import (
+    BAD_SAMPLE_RETENTION_DAYS,
+    CLEANUP_INTERVAL_MINUTES,
+    POLL_RUN_RETENTION_DAYS,
+    SAMPLE_RETENTION_DAYS,
+)
+
 RECENT_WINDOW_SECONDS = 90
 STALE_THRESHOLD_SECONDS = 150
 EXPECTED_POLL_INTERVAL_SECONDS = 60
@@ -67,13 +74,24 @@ def get_dashboard_status(db_path: str) -> dict[str, Any]:
             "message": "",
             "generated_at_utc": generated_at.replace(microsecond=0).isoformat(),
             "db_path": str(db_file),
+            "db_size_mb": 0.0,
             "last_poll_finished_at_utc": None,
             "last_poll_age_seconds": None,
             "total_enabled_machines": 0,
             "total_enabled_tags": 0,
+            "total_sample_rows": 0,
+            "total_good_sample_rows": 0,
+            "total_bad_sample_rows": 0,
+            "oldest_sample_utc": None,
+            "newest_sample_utc": None,
+            "poll_run_count": 0,
             "recent_good_samples": 0,
             "recent_bad_samples": 0,
             "latest_poll_duration_seconds": None,
+            "sample_retention_days": SAMPLE_RETENTION_DAYS,
+            "bad_sample_retention_days": BAD_SAMPLE_RETENTION_DAYS,
+            "poll_run_retention_days": POLL_RUN_RETENTION_DAYS,
+            "cleanup_interval_minutes": CLEANUP_INTERVAL_MINUTES,
         },
         "machines": [],
         "recent_poll_runs": [],
@@ -98,6 +116,7 @@ def get_dashboard_status(db_path: str) -> dict[str, Any]:
         enabled_machine_count = get_enabled_machine_count(conn)
         enabled_tag_count = get_enabled_tag_count(conn)
         latest_poll = get_latest_poll_run(conn)
+        storage_stats = get_storage_stats(conn, db_file)
         recent_cutoff_utc = (generated_at - timedelta(seconds=RECENT_WINDOW_SECONDS)).replace(microsecond=0)
         recent_cutoff_iso = recent_cutoff_utc.isoformat()
         recent_sample_totals = get_recent_sample_totals(conn, recent_cutoff_iso)
@@ -112,8 +131,15 @@ def get_dashboard_status(db_path: str) -> dict[str, Any]:
             if latest_poll and latest_poll["finished_at_utc"]
             else None
         )
+        overall["db_size_mb"] = storage_stats["db_size_mb"]
         overall["total_enabled_machines"] = enabled_machine_count
         overall["total_enabled_tags"] = enabled_tag_count
+        overall["total_sample_rows"] = storage_stats["total_sample_rows"]
+        overall["total_good_sample_rows"] = storage_stats["total_good_sample_rows"]
+        overall["total_bad_sample_rows"] = storage_stats["total_bad_sample_rows"]
+        overall["oldest_sample_utc"] = storage_stats["oldest_sample_utc"]
+        overall["newest_sample_utc"] = storage_stats["newest_sample_utc"]
+        overall["poll_run_count"] = storage_stats["poll_run_count"]
         overall["recent_good_samples"] = recent_sample_totals["good"]
         overall["recent_bad_samples"] = recent_sample_totals["bad"]
         overall["latest_poll_duration_seconds"] = (
@@ -148,6 +174,31 @@ def get_enabled_machine_count(conn: sqlite3.Connection) -> int:
 def get_enabled_tag_count(conn: sqlite3.Connection) -> int:
     row = conn.execute("SELECT COUNT(*) AS count FROM tags WHERE enabled = 1").fetchone()
     return int(row["count"]) if row else 0
+
+
+def get_storage_stats(conn: sqlite3.Connection, db_file: Path) -> dict[str, Any]:
+    sample_row = conn.execute(
+        """
+        SELECT
+            COUNT(*) AS total_sample_rows,
+            COALESCE(SUM(CASE WHEN quality = 'good' THEN 1 ELSE 0 END), 0) AS total_good_sample_rows,
+            COALESCE(SUM(CASE WHEN quality = 'bad' THEN 1 ELSE 0 END), 0) AS total_bad_sample_rows,
+            MIN(ts_utc) AS oldest_sample_utc,
+            MAX(ts_utc) AS newest_sample_utc
+        FROM tag_samples
+        """
+    ).fetchone()
+    poll_row = conn.execute("SELECT COUNT(*) AS poll_run_count FROM poll_runs").fetchone()
+    db_size_bytes = db_file.stat().st_size if db_file.exists() else 0
+    return {
+        "db_size_mb": round(db_size_bytes / (1024 * 1024), 2),
+        "total_sample_rows": int(sample_row["total_sample_rows"]) if sample_row else 0,
+        "total_good_sample_rows": int(sample_row["total_good_sample_rows"]) if sample_row else 0,
+        "total_bad_sample_rows": int(sample_row["total_bad_sample_rows"]) if sample_row else 0,
+        "oldest_sample_utc": sample_row["oldest_sample_utc"] if sample_row else None,
+        "newest_sample_utc": sample_row["newest_sample_utc"] if sample_row else None,
+        "poll_run_count": int(poll_row["poll_run_count"]) if poll_row else 0,
+    }
 
 
 def get_latest_poll_run(conn: sqlite3.Connection) -> sqlite3.Row | None:

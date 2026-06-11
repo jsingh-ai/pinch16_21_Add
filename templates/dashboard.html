@@ -11,6 +11,7 @@
     <div>
       <h1>OPC UA Collector Dashboard</h1>
       <p class="subtitle">SQLite-backed monitoring for collector health and insert quality</p>
+      <p class="timezone-note">Times shown in US Central time.</p>
     </div>
     <div class="refresh-meta">
       <div id="generated-at">Loading...</div>
@@ -45,6 +46,23 @@
       <article class="card">
         <div class="card-label">Latest Poll Duration</div>
         <div id="poll-duration" class="card-value">-</div>
+      </article>
+      <article class="card">
+        <div class="card-label">Storage / Retention</div>
+        <div id="storage-size" class="card-value">-</div>
+        <div id="storage-retention" class="card-subvalue">-</div>
+        <div id="storage-counts" class="card-subvalue">-</div>
+        <div id="storage-range" class="card-subvalue">-</div>
+      </article>
+      <article class="card actions-card">
+        <div class="card-label">Actions</div>
+        <div id="action-message" class="card-subvalue">Maintenance actions do not delete machines or tags.</div>
+        <div class="actions-list">
+          <button type="button" data-action="cleanup-now" class="action-button action-primary">Run cleanup now</button>
+          <button type="button" data-action="clear-poll-runs" class="action-button action-warning">Clear poll runs</button>
+          <button type="button" data-action="clear-bad-samples" class="action-button action-warning">Clear bad samples</button>
+          <button type="button" data-action="clear-monitoring-data" class="action-button action-danger">Clear monitoring data</button>
+        </div>
       </article>
     </section>
 

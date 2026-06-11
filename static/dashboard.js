@@ -1,4 +1,14 @@
 const REFRESH_MS = 15000;
+const CENTRAL_TIMEZONE = "America/Chicago";
+const centralFormatter = new Intl.DateTimeFormat("en-US", {
+  timeZone: CENTRAL_TIMEZONE,
+  month: "short",
+  day: "numeric",
+  year: "numeric",
+  hour: "numeric",
+  minute: "2-digit",
+  hour12: true,
+});
 
 function statusClass(status) {
   const normalized = (status || "UNKNOWN").toLowerCase();
@@ -15,11 +25,47 @@ function text(value, fallback = "-") {
   return String(value);
 }
 
-function formatSeconds(value) {
+function formatCentralTime(isoString) {
+  if (!isoString) {
+    return "Never";
+  }
+  const date = new Date(isoString);
+  if (Number.isNaN(date.getTime())) {
+    return "Never";
+  }
+  const parts = centralFormatter.formatToParts(date);
+  const partMap = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${partMap.month} ${partMap.day}, ${partMap.year} ${partMap.hour}:${partMap.minute} ${partMap.dayPeriod} CT`;
+}
+
+function formatAge(seconds) {
+  if (seconds === null || seconds === undefined) {
+    return "Never";
+  }
+  const totalSeconds = Math.max(0, Math.round(Number(seconds)));
+  if (totalSeconds < 60) {
+    return `${totalSeconds}s`;
+  }
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const remainingSeconds = totalSeconds % 60;
+  if (hours > 0) {
+    return `${hours}h ${String(minutes).padStart(2, "0")}m`;
+  }
+  return `${minutes}m ${String(remainingSeconds).padStart(2, "0")}s`;
+}
+
+function formatMegabytes(value) {
   if (value === null || value === undefined) {
     return "-";
   }
-  return `${Number(value).toFixed(1)}s`;
+  return `${Number(value).toFixed(2)} MB`;
+}
+
+function setActionMessage(message, tone = "warning") {
+  const node = document.getElementById("action-message");
+  node.textContent = message;
+  node.className = `card-subvalue message-${tone}`;
 }
 
 function renderOverall(overall) {
@@ -27,15 +73,23 @@ function renderOverall(overall) {
   badge.textContent = text(overall.status, "UNKNOWN");
   badge.className = `status-badge ${statusClass(overall.status)}`;
   document.getElementById("overall-message").textContent = text(overall.message);
-  document.getElementById("generated-at").textContent = `Generated ${text(overall.generated_at_utc)}`;
-  document.getElementById("last-poll-finished").textContent = text(overall.last_poll_finished_at_utc);
+  document.getElementById("generated-at").textContent = `Generated ${formatCentralTime(overall.generated_at_utc)}`;
+  document.getElementById("last-poll-finished").textContent = formatCentralTime(overall.last_poll_finished_at_utc);
   document.getElementById("last-poll-age").textContent = overall.last_poll_age_seconds === null
-    ? "-"
-    : `Age ${formatSeconds(overall.last_poll_age_seconds)}`;
+    ? "Age Never"
+    : `Age ${formatAge(overall.last_poll_age_seconds)}`;
   document.getElementById("total-tags").textContent = text(overall.total_enabled_tags, "0");
   document.getElementById("recent-good").textContent = text(overall.recent_good_samples, "0");
   document.getElementById("recent-bad").textContent = text(overall.recent_bad_samples, "0");
-  document.getElementById("poll-duration").textContent = formatSeconds(overall.latest_poll_duration_seconds);
+  document.getElementById("poll-duration").textContent =
+    overall.latest_poll_duration_seconds === null ? "-" : formatAge(overall.latest_poll_duration_seconds);
+  document.getElementById("storage-size").textContent = formatMegabytes(overall.db_size_mb);
+  document.getElementById("storage-retention").textContent =
+    `Good ${text(overall.sample_retention_days, "0")}d | Bad ${text(overall.bad_sample_retention_days, "0")}d | Polls ${text(overall.poll_run_retention_days, "0")}d`;
+  document.getElementById("storage-counts").textContent =
+    `Samples ${text(overall.total_sample_rows, "0")} | Good ${text(overall.total_good_sample_rows, "0")} | Bad ${text(overall.total_bad_sample_rows, "0")} | Poll runs ${text(overall.poll_run_count, "0")}`;
+  document.getElementById("storage-range").textContent =
+    `Oldest ${formatCentralTime(overall.oldest_sample_utc)} | Newest ${formatCentralTime(overall.newest_sample_utc)}`;
 }
 
 function renderMachineStrip(machines) {
@@ -69,13 +123,13 @@ function renderMachines(machines) {
     row.innerHTML = `
       <td>
         <strong>${text(machine.machine_name)}</strong>
-        <div class="muted">${text(machine.last_updated_display, "Never")}</div>
+        <div class="muted">${formatCentralTime(machine.latest_sample_utc)}</div>
       </td>
       <td><span class="status-badge ${statusClass(machine.status)}">${text(machine.status)}</span></td>
       <td class="endpoint">${text(machine.endpoint_url)}</td>
       <td>${text(machine.enabled_tags, "0")}</td>
-      <td>${text(machine.latest_sample_utc, "Never")}</td>
-      <td>${formatSeconds(machine.latest_sample_age_seconds)}</td>
+      <td>${formatCentralTime(machine.latest_sample_utc)}</td>
+      <td>${formatAge(machine.latest_sample_age_seconds)}</td>
       <td>${text(machine.recent_good_samples, "0")}</td>
       <td>${text(machine.recent_bad_samples, "0")}</td>
       <td>${text(machine.recent_success_rate, "0")}%</td>
@@ -97,9 +151,9 @@ function renderPollRuns(runs) {
   runs.forEach((run) => {
     const row = document.createElement("tr");
     row.innerHTML = `
-      <td>${text(run.started_at_utc)}</td>
-      <td>${text(run.finished_at_utc)}</td>
-      <td>${formatSeconds(run.duration_seconds)}</td>
+      <td>${formatCentralTime(run.started_at_utc)}</td>
+      <td>${formatCentralTime(run.finished_at_utc)}</td>
+      <td>${run.duration_seconds === null ? "-" : formatAge(run.duration_seconds)}</td>
       <td>${text(run.machines_ok, "0")}/${text(run.machines_attempted, "0")}</td>
       <td>${text(run.tags_ok, "0")}/${text(run.tags_attempted, "0")}</td>
       <td>${text(run.tags_failed, "0")}</td>
@@ -119,7 +173,7 @@ function renderErrors(errors) {
     const item = document.createElement("div");
     item.className = "error-item";
     item.innerHTML = `
-      <div class="error-meta">${text(error.timestamp_utc)} | ${text(error.machine_name)} | age ${formatSeconds(error.age_seconds)}</div>
+      <div class="error-meta">${formatCentralTime(error.timestamp_utc)} | ${text(error.machine_name)} | age ${formatAge(error.age_seconds)}</div>
       <div><strong>${text(error.tag_name)}</strong></div>
       <div class="node-id">${text(error.node_id)}</div>
       <div class="error-text">${text(error.error_text)}</div>
@@ -136,14 +190,75 @@ function renderCriticalFallback(message) {
     last_poll_finished_at_utc: null,
     last_poll_age_seconds: null,
     total_enabled_tags: 0,
+    db_size_mb: 0,
+    total_sample_rows: 0,
+    total_good_sample_rows: 0,
+    total_bad_sample_rows: 0,
+    poll_run_count: 0,
     recent_good_samples: 0,
     recent_bad_samples: 0,
     latest_poll_duration_seconds: null,
+    sample_retention_days: 0,
+    bad_sample_retention_days: 0,
+    poll_run_retention_days: 0,
   });
   renderMachineStrip([]);
   renderMachines([]);
   renderPollRuns([]);
   renderErrors([]);
+}
+
+function setActionButtonsDisabled(disabled) {
+  document.querySelectorAll(".action-button").forEach((button) => {
+    button.disabled = disabled;
+  });
+}
+
+async function postAction(endpoint, confirmMessage = null) {
+  if (confirmMessage) {
+    const confirmed = window.confirm(confirmMessage);
+    if (!confirmed) {
+      return { cancelled: true };
+    }
+  }
+
+  setActionButtonsDisabled(true);
+  const actionName = endpoint.split("/").pop();
+  setActionMessage(`Running ${actionName}...`, "warning");
+
+  try {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(confirmMessage ? { confirm: true } : {}),
+    });
+    const payload = await response.json();
+    if (!response.ok || !payload.ok) {
+      setActionMessage(payload.error || `Action failed: ${actionName}`, "critical");
+      return payload;
+    }
+    const resultSummary = payload.deleted || payload.result || {};
+    setActionMessage(`${actionName} completed: ${JSON.stringify(resultSummary)}`, "good");
+    await refreshDashboard();
+    return payload;
+  } catch (error) {
+    setActionMessage(`Action failed: ${actionName}`, "critical");
+    return { ok: false };
+  } finally {
+    setActionButtonsDisabled(false);
+  }
+}
+
+function bindActionButtons() {
+  document.querySelectorAll(".action-button").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const actionName = button.dataset.action;
+      const confirmMessage = actionName === "cleanup-now"
+        ? null
+        : `Confirm action: ${actionName}. This does not delete machines or tags.`;
+      await postAction(`/api/actions/${actionName}`, confirmMessage);
+    });
+  });
 }
 
 async function refreshDashboard() {
@@ -165,4 +280,5 @@ async function refreshDashboard() {
 }
 
 refreshDashboard();
+bindActionButtons();
 setInterval(refreshDashboard, REFRESH_MS);
