@@ -86,6 +86,8 @@ Create tables and import tag definitions from `Tag_Files`:
 python run_collector.py --init-only
 ```
 
+`--init-only` is the full tag-definition sync step. On a networked Azure MySQL database it can take noticeably longer than normal polling startup.
+
 Show the resolved per-machine auth config:
 
 ```bash
@@ -105,6 +107,8 @@ Run the collector continuously:
 ```bash
 python run_collector.py
 ```
+
+After tags already exist in MySQL, a normal collector start skips the heavy CSV tag re-import step and goes straight into polling.
 
 Only one collector instance is allowed by default to avoid duplicate writes. Use `--allow-multiple` only if duplicate polling is intentional.
 

@@ -72,6 +72,13 @@ def show_db_stats() -> int:
     return 0
 
 
+def get_tag_count(conn) -> int:
+    with conn.cursor() as cursor:
+        cursor.execute("SELECT COUNT(*) AS count FROM tags")
+        row = cursor.fetchone()
+    return int(row["count"] or 0)
+
+
 def main() -> int:
     configure_logging()
     parser = build_arg_parser()
@@ -115,7 +122,15 @@ def main() -> int:
             LOGGER.warning("Cleared monitoring data: %s", clear_monitoring_data(conn=conn))
             return 0
 
-        load_tag_files(conn)
+        tag_count = get_tag_count(conn)
+        should_import_tags = args.init_only or tag_count == 0
+        if should_import_tags:
+            load_tag_files(conn)
+        else:
+            LOGGER.info(
+                "Skipping CSV tag import on startup because %s tags already exist in MySQL. Use --init-only when you want to resync tag definitions.",
+                tag_count,
+            )
 
         if args.init_only:
             LOGGER.info("Initialization complete; skipping polling due to --init-only")
