@@ -20,8 +20,7 @@ def patch_blank_basic256_username_token(
     def _add_user_auth(self: Any, params: Any, *args: Any) -> None:
         params.UserIdentityToken.PolicyId = policy_id
         params.UserIdentityToken.UserName = username
-        blank_password = password.encode("utf-8")
-        params.UserIdentityToken.Password = self._encrypt_password(blank_password, policy_uri)
+        params.UserIdentityToken.Password = self._encrypt_password(password, policy_uri)
         params.UserIdentityToken.EncryptionAlgorithm = policy_uri
 
     client._add_user_auth = types.MethodType(_add_user_auth, client)

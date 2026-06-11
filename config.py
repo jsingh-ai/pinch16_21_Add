@@ -46,13 +46,9 @@ MACHINE_AUTH_CONFIG: dict[str, dict[str, object]] = {
         "endpoint_url": None,
     },
     "Pinch 20": {
-        "auth_mode": AUTH_MODE_USERNAME_BLANK_BASIC256_TOKEN,
+        "auth_mode": AUTH_MODE_ANONYMOUS,
         "enabled": True,
         "endpoint_url": None,
-        "username": "OpcUaViewer",
-        "password": "",
-        "policy_id": "3",
-        "policy_uri": "http://opcfoundation.org/UA/SecurityPolicy#Basic256",
     },
     "Pinch 21": {
         "auth_mode": AUTH_MODE_ANONYMOUS,
