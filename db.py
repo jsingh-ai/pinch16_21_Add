@@ -190,7 +190,7 @@ def get_tables(conn: Connection) -> set[str]:
     with conn.cursor() as cursor:
         cursor.execute(
             """
-            SELECT table_name
+            SELECT table_name AS table_name
             FROM information_schema.tables
             WHERE table_schema = %s
             """,
@@ -207,7 +207,9 @@ def get_table_column_types(conn: Connection, table_name: str) -> dict[str, str]:
     with conn.cursor() as cursor:
         cursor.execute(
             """
-            SELECT column_name, data_type
+            SELECT
+                column_name AS column_name,
+                data_type AS data_type
             FROM information_schema.columns
             WHERE table_schema = %s AND table_name = %s
             """,
@@ -221,7 +223,7 @@ def get_index_names(conn: Connection) -> set[str]:
     with conn.cursor() as cursor:
         cursor.execute(
             """
-            SELECT DISTINCT index_name
+            SELECT DISTINCT index_name AS index_name
             FROM information_schema.statistics
             WHERE table_schema = %s
             """,
