@@ -13,6 +13,13 @@ def configure_logging() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    for logger_name in (
+        "opcua",
+        "opcua.client",
+        "opcua.client.ua_client",
+        "opcua.uaprotocol",
+    ):
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
 
 
 def main() -> int:

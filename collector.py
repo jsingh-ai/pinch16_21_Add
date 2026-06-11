@@ -16,6 +16,7 @@ from config import (
     DEFAULT_CONNECT_TIMEOUT_SECONDS,
     DEFAULT_POLL_INTERVAL_SECONDS,
     DEFAULT_SESSION_TIMEOUT_MS,
+    DEFAULT_TAG_FAILURE_LOG_SAMPLE,
     MACHINE_AUTH_CONFIG,
 )
 from db import transaction
@@ -52,6 +53,16 @@ class PollRunStats:
     tags_attempted: int
     tags_ok: int
     tags_failed: int
+    failed_machines: list[str]
+    machine_tag_failures: list[str]
+
+
+@dataclass(slots=True)
+class MachinePollResult:
+    tags_attempted: int
+    tags_ok: int
+    tags_failed: int
+    sampled_failures: list[str]
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -162,20 +173,27 @@ def normalize_value(value: Any) -> tuple[str, float | None]:
     return (text, numeric_value)
 
 
-def poll_machine(conn: sqlite3.Connection, machine: MachineRecord, started_ts: str) -> tuple[int, int]:
+def poll_machine(conn: sqlite3.Connection, machine: MachineRecord, started_ts: str) -> MachinePollResult:
     tags = load_enabled_tags_for_machine(conn, machine.id)
     if not tags:
         LOGGER.info("Skipping %s because no enabled tags were found", machine.machine_name)
-        return (0, 0)
+        return MachinePollResult(tags_attempted=0, tags_ok=0, tags_failed=0, sampled_failures=[])
 
     rows_to_insert: list[tuple[object, ...]] = []
     tags_ok = 0
     tags_failed = 0
+    sampled_failures: list[str] = []
+    LOGGER.info(
+        "Machine start %s endpoint=%s tags=%s",
+        machine.machine_name,
+        machine.endpoint_url,
+        len(tags),
+    )
 
     client = create_client(machine)
     try:
         client.connect()
-        LOGGER.info("Connected to %s at %s", machine.machine_name, machine.endpoint_url)
+        LOGGER.info("Machine connected %s", machine.machine_name)
 
         for tag in tags:
             try:
@@ -207,15 +225,14 @@ def poll_machine(conn: sqlite3.Connection, machine: MachineRecord, started_ts: s
                     )
                 )
                 tags_failed += 1
-                LOGGER.warning(
-                    "Read failed for %s [%s]: %s",
-                    tag.display_name or tag.node_id,
-                    machine.machine_name,
-                    exc,
-                )
+                if len(sampled_failures) < DEFAULT_TAG_FAILURE_LOG_SAMPLE:
+                    sampled_failures.append(
+                        f"{tag.display_name or tag.node_id}: {exc}"
+                    )
     finally:
         try:
             client.disconnect()
+            LOGGER.info("Machine disconnected %s", machine.machine_name)
         except Exception as exc:
             LOGGER.warning("Disconnect failed for %s: %s", machine.machine_name, exc)
 
@@ -235,7 +252,27 @@ def poll_machine(conn: sqlite3.Connection, machine: MachineRecord, started_ts: s
             """,
             rows_to_insert,
         )
-    return (tags_ok, tags_failed)
+    LOGGER.info(
+        "Machine complete %s tags_attempted=%s tags_ok=%s tags_failed=%s",
+        machine.machine_name,
+        len(tags),
+        tags_ok,
+        tags_failed,
+    )
+    if sampled_failures:
+        LOGGER.warning(
+            "Machine tag failure samples %s sample_count=%s total_tag_failures=%s samples=%s",
+            machine.machine_name,
+            len(sampled_failures),
+            tags_failed,
+            " | ".join(sampled_failures),
+        )
+    return MachinePollResult(
+        tags_attempted=len(tags),
+        tags_ok=tags_ok,
+        tags_failed=tags_failed,
+        sampled_failures=sampled_failures,
+    )
 
 
 def run_poll_cycle(conn: sqlite3.Connection) -> PollRunStats:
@@ -249,22 +286,27 @@ def run_poll_cycle(conn: sqlite3.Connection) -> PollRunStats:
     tags_attempted = 0
     tags_ok = 0
     tags_failed = 0
+    failed_machines: list[str] = []
+    machine_tag_failures: list[str] = []
 
     for machine in machines:
         machines_attempted += 1
         machine_tags = load_enabled_tags_for_machine(conn, machine.id)
         tags_attempted += len(machine_tags)
         try:
-            ok_count, failed_count = poll_machine(conn, machine, started_ts)
+            machine_result = poll_machine(conn, machine, started_ts)
         except Exception as exc:
             machines_failed += 1
             tags_failed += len(machine_tags)
+            failed_machines.append(machine.machine_name)
             LOGGER.exception("Machine poll failed for %s: %s", machine.machine_name, exc)
             continue
 
         machines_ok += 1
-        tags_ok += ok_count
-        tags_failed += failed_count
+        tags_ok += machine_result.tags_ok
+        tags_failed += machine_result.tags_failed
+        if machine_result.tags_failed > 0:
+            machine_tag_failures.append(f"{machine.machine_name}:{machine_result.tags_failed}")
 
     finished_ts = utc_now_iso()
     duration = time.monotonic() - started
@@ -278,16 +320,22 @@ def run_poll_cycle(conn: sqlite3.Connection) -> PollRunStats:
         tags_attempted=tags_attempted,
         tags_ok=tags_ok,
         tags_failed=tags_failed,
+        failed_machines=failed_machines,
+        machine_tag_failures=machine_tag_failures,
     )
     persist_poll_run(conn, stats)
+    failed_machines_text = ", ".join(stats.failed_machines) if stats.failed_machines else "none"
+    tag_failures_text = ", ".join(stats.machine_tag_failures) if stats.machine_tag_failures else "none"
     LOGGER.info(
-        "Poll summary started=%s duration=%.2fs machines ok=%s failed=%s tags ok=%s failed=%s",
+        "Poll summary started=%s duration=%.2fs machines ok=%s failed=%s [%s] tags ok=%s failed=%s tag_failures_by_machine=[%s]",
         stats.started_at_utc,
         stats.duration_seconds,
         stats.machines_ok,
         stats.machines_failed,
+        failed_machines_text,
         stats.tags_ok,
         stats.tags_failed,
+        tag_failures_text,
     )
     return stats
 
