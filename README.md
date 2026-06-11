@@ -59,6 +59,25 @@ SQLite is configured with:
 
 The schema includes `machines`, `tags`, `tag_samples`, and `poll_runs`, plus indexes for common time-series queries.
 
+## Collector Dashboard
+
+Install dependencies, initialize the database if needed, run the collector, then start the dashboard:
+
+```bash
+pip install -r requirements.txt
+python run_collector.py --init-only
+python run_collector.py
+python dashboard_app.py --host 0.0.0.0 --port 5050
+```
+
+Then open:
+
+```text
+http://localhost:5050
+```
+
+The dashboard reads only from SQLite and does not connect to OPC UA directly. It refreshes every 15 seconds and exposes a JSON status API at `/api/status`.
+
 ## Future Migration
 
 To migrate later to PostgreSQL or MySQL, keep the same logical schema and replace the small SQLite access layer in `db.py` plus the SQL connection setup. The importer and collector logic are already separated from transport details, so the main change would be swapping the DB driver and adapting SQL parameter style or upsert syntax.

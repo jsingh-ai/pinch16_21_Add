@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OPC UA Collector Dashboard</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <h1>OPC UA Collector Dashboard</h1>
+      <p class="subtitle">SQLite-backed monitoring for collector health and insert quality</p>
+    </div>
+    <div class="refresh-meta">
+      <div id="generated-at">Loading...</div>
+      <div>Auto-refresh every 15s</div>
+    </div>
+  </header>
+
+  <main class="page">
+    <section class="cards" id="summary-cards">
+      <article class="card status-card">
+        <div class="card-label">Overall Status</div>
+        <div id="overall-status" class="status-badge status-unknown">UNKNOWN</div>
+        <div id="overall-message" class="card-value muted">Waiting for data...</div>
+      </article>
+      <article class="card">
+        <div class="card-label">Last Poll Finished</div>
+        <div id="last-poll-finished" class="card-value">-</div>
+        <div id="last-poll-age" class="card-subvalue">-</div>
+      </article>
+      <article class="card">
+        <div class="card-label">Total Tags Expected</div>
+        <div id="total-tags" class="card-value">-</div>
+      </article>
+      <article class="card">
+        <div class="card-label">Last 90s Good Samples</div>
+        <div id="recent-good" class="card-value">-</div>
+      </article>
+      <article class="card">
+        <div class="card-label">Last 90s Failed Samples</div>
+        <div id="recent-bad" class="card-value">-</div>
+      </article>
+      <article class="card">
+        <div class="card-label">Latest Poll Duration</div>
+        <div id="poll-duration" class="card-value">-</div>
+      </article>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <h2>Machine Strip</h2>
+      </div>
+      <div id="machine-strip" class="machine-strip"></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <h2>Machine Status</h2>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Machine</th>
+              <th>Status</th>
+              <th>Endpoint</th>
+              <th>Enabled Tags</th>
+              <th>Latest Sample</th>
+              <th>Age s</th>
+              <th>Good 90s</th>
+              <th>Bad 90s</th>
+              <th>Success %</th>
+              <th>Last Poll Tags</th>
+              <th>Failed Tags</th>
+              <th>Top Error</th>
+            </tr>
+          </thead>
+          <tbody id="machine-table-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="grid-two">
+      <section class="panel">
+        <div class="panel-header">
+          <h2>Recent Poll Runs</h2>
+        </div>
+        <div class="table-wrap compact">
+          <table>
+            <thead>
+              <tr>
+                <th>Started</th>
+                <th>Finished</th>
+                <th>Duration</th>
+                <th>Machines</th>
+                <th>Tags</th>
+                <th>Failed Tags</th>
+              </tr>
+            </thead>
+            <tbody id="poll-runs-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <h2>Recent Errors</h2>
+        </div>
+        <div id="recent-errors" class="errors-list"></div>
+      </section>
+    </section>
+  </main>
+
+  <script src="{{ url_for('static', filename='dashboard.js') }}"></script>
+</body>
+</html>

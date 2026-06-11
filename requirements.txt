@@ -1,3 +1,4 @@
 opcua
 cryptography
 lxml
+Flask
