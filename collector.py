@@ -13,13 +13,14 @@ from opcua import Client
 
 from config import (
     AUTH_MODE_USERNAME_BLANK_BASIC256_TOKEN,
+    CLEANUP_INTERVAL_MINUTES,
     DEFAULT_CONNECT_TIMEOUT_SECONDS,
     DEFAULT_POLL_INTERVAL_SECONDS,
     DEFAULT_SESSION_TIMEOUT_MS,
     DEFAULT_TAG_FAILURE_LOG_SAMPLE,
     MACHINE_AUTH_CONFIG,
 )
-from db import transaction
+from db import cleanup_old_data, transaction
 from opcua_auth import patch_blank_basic256_username_token
 
 LOGGER = logging.getLogger(__name__)
@@ -84,6 +85,40 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Initialize schema and import tags without polling",
     )
+    parser.add_argument(
+        "--machine",
+        help="Poll only a specific machine_name",
+    )
+    parser.add_argument(
+        "--cleanup-now",
+        action="store_true",
+        help="Run retention cleanup once and exit",
+    )
+    parser.add_argument(
+        "--clear-poll-runs",
+        action="store_true",
+        help="Clear poll_runs only; requires --yes",
+    )
+    parser.add_argument(
+        "--clear-bad-samples",
+        action="store_true",
+        help="Clear bad tag_samples only; requires --yes",
+    )
+    parser.add_argument(
+        "--clear-all-samples",
+        action="store_true",
+        help="Clear all tag_samples; requires --yes",
+    )
+    parser.add_argument(
+        "--clear-monitoring-data",
+        action="store_true",
+        help="Clear tag_samples and poll_runs; requires --yes",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm destructive clear commands",
+    )
     return parser
 
 
@@ -91,15 +126,26 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def load_enabled_machines(conn: sqlite3.Connection) -> list[MachineRecord]:
-    rows = conn.execute(
-        """
-        SELECT id, machine_name, endpoint_url, auth_mode
-        FROM machines
-        WHERE enabled = 1
-        ORDER BY machine_name
-        """
-    ).fetchall()
+def load_enabled_machines(conn: sqlite3.Connection, machine_name: str | None = None) -> list[MachineRecord]:
+    if machine_name:
+        rows = conn.execute(
+            """
+            SELECT id, machine_name, endpoint_url, auth_mode
+            FROM machines
+            WHERE enabled = 1 AND machine_name = ?
+            ORDER BY machine_name
+            """,
+            (machine_name,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT id, machine_name, endpoint_url, auth_mode
+            FROM machines
+            WHERE enabled = 1
+            ORDER BY machine_name
+            """
+        ).fetchall()
     return [
         MachineRecord(
             id=int(row["id"]),
@@ -279,10 +325,10 @@ def poll_machine(conn: sqlite3.Connection, machine: MachineRecord, started_ts: s
     )
 
 
-def run_poll_cycle(conn: sqlite3.Connection) -> PollRunStats:
+def run_poll_cycle(conn: sqlite3.Connection, machine_name: str | None = None) -> PollRunStats:
     started = time.monotonic()
     started_ts = utc_now_iso()
-    machines = load_enabled_machines(conn)
+    machines = load_enabled_machines(conn, machine_name=machine_name)
 
     machines_attempted = 0
     machines_ok = 0
@@ -389,12 +435,32 @@ def sleep_until_next_interval(interval_seconds: int, align: bool) -> None:
         time.sleep(delay)
 
 
-def collector_loop(conn: sqlite3.Connection, once: bool, interval_seconds: int, align_sleep: bool) -> None:
+def run_scheduled_cleanup(conn: sqlite3.Connection) -> None:
+    try:
+        cleanup_old_data(conn=conn)
+    except Exception as exc:
+        LOGGER.exception("Cleanup failed: %s", exc)
+
+
+def collector_loop(
+    conn: sqlite3.Connection,
+    once: bool,
+    interval_seconds: int,
+    align_sleep: bool,
+    machine_name: str | None = None,
+) -> None:
+    run_scheduled_cleanup(conn)
+    cleanup_interval_seconds = max(CLEANUP_INTERVAL_MINUTES, 1) * 60
+    last_cleanup_monotonic = time.monotonic()
     while True:
         if not once and align_sleep:
             sleep_until_next_interval(interval_seconds, True)
-        run_poll_cycle(conn)
+        run_poll_cycle(conn, machine_name=machine_name)
         if once:
             return
+        now_monotonic = time.monotonic()
+        if now_monotonic - last_cleanup_monotonic >= cleanup_interval_seconds:
+            run_scheduled_cleanup(conn)
+            last_cleanup_monotonic = now_monotonic
         if not align_sleep:
             sleep_until_next_interval(interval_seconds, False)

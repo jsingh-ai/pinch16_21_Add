@@ -78,6 +78,26 @@ http://localhost:5050
 
 The dashboard reads only from SQLite and does not connect to OPC UA directly. It refreshes every 15 seconds and exposes a JSON status API at `/api/status`.
 
+## Data Retention And Cleanup
+
+By default:
+
+- good samples are kept for 14 days
+- bad samples are kept for 60 days
+- `poll_runs` are kept for 14 days
+- `machines` and `tags` are never deleted by cleanup
+
+Automatic cleanup runs once at collector startup and then every 60 minutes while the collector is running. Cleanup uses SQL `DELETE` statements with timestamp cutoffs and does not load historical samples into Python memory.
+
+Manual cleanup commands are available, but destructive clear operations require `--yes`.
+
+```bash
+python run_collector.py --cleanup-now
+python run_collector.py --clear-poll-runs --yes
+python run_collector.py --clear-bad-samples --yes
+python run_collector.py --clear-monitoring-data --yes
+```
+
 ## Future Migration
 
 To migrate later to PostgreSQL or MySQL, keep the same logical schema and replace the small SQLite access layer in `db.py` plus the SQL connection setup. The importer and collector logic are already separated from transport details, so the main change would be swapping the DB driver and adapting SQL parameter style or upsert syntax.
