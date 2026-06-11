@@ -1,87 +1,55 @@
 from __future__ import annotations
 
-import sqlite3
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any
 
 from config import (
     BAD_SAMPLE_RETENTION_DAYS,
     CLEANUP_INTERVAL_MINUTES,
+    MYSQL_DATABASE,
     POLL_RUN_RETENTION_DAYS,
     SAMPLE_RETENTION_DAYS,
 )
+from db import Connection, from_db_datetime, get_connection, get_db_stats, get_tables, to_db_datetime, to_iso_utc, utc_now
 
 RECENT_WINDOW_SECONDS = 90
 STALE_THRESHOLD_SECONDS = 150
-EXPECTED_POLL_INTERVAL_SECONDS = 60
 RECENT_ERROR_LIMIT = 20
 RECENT_POLL_LIMIT = 10
 REQUIRED_TABLES = {"machines", "tags", "tag_samples", "poll_runs"}
 
 
-def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def utc_now_iso() -> str:
-    return utc_now().replace(microsecond=0).isoformat()
-
-
-def parse_iso_timestamp(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    try:
-        normalized = value.replace("Z", "+00:00")
-        dt = datetime.fromisoformat(normalized)
-    except ValueError:
-        return None
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
-
-
-def age_seconds(value: str | None, now_utc: datetime) -> float | None:
-    dt = parse_iso_timestamp(value)
+def age_seconds(value: datetime | str | None, now_utc: datetime) -> float | None:
+    dt: datetime | None = None
+    if isinstance(value, datetime):
+        dt = from_db_datetime(value)
+    elif isinstance(value, str):
+        try:
+            normalized = value.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(normalized)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                dt = dt.astimezone(timezone.utc)
+        except ValueError:
+            dt = None
     if dt is None:
         return None
     return max(0.0, (now_utc - dt).total_seconds())
 
 
-def get_read_connection(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(f"file:{Path(db_path)}?mode=ro", timeout=5.0, uri=True)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout=5000")
-    conn.execute("PRAGMA query_only=ON")
-    return conn
+def table_exists(conn: Connection, table_name: str) -> bool:
+    return table_name in get_tables(conn)
 
 
-def tables_exist(conn: sqlite3.Connection) -> bool:
-    rows = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (?, ?, ?, ?)",
-        tuple(sorted(REQUIRED_TABLES)),
-    ).fetchall()
-    present = {str(row["name"]) for row in rows}
-    return REQUIRED_TABLES.issubset(present)
-
-
-def table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
-    row = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
-        (table_name,),
-    ).fetchone()
-    return row is not None
-
-
-def get_dashboard_status(db_path: str) -> dict[str, Any]:
-    db_file = Path(db_path)
+def get_dashboard_status() -> dict[str, Any]:
     generated_at = utc_now()
     base_response = {
         "overall": {
             "status": "CRITICAL",
             "message": "",
-            "generated_at_utc": generated_at.replace(microsecond=0).isoformat(),
-            "db_path": str(db_file),
+            "generated_at_utc": to_iso_utc(generated_at),
+            "db_name": MYSQL_DATABASE,
             "db_size_mb": 0.0,
             "last_poll_finished_at_utc": None,
             "last_poll_age_seconds": None,
@@ -106,150 +74,107 @@ def get_dashboard_status(db_path: str) -> dict[str, Any]:
         "recent_errors": [],
     }
 
-    if not db_file.exists():
-        base_response["overall"]["message"] = "Dashboard cannot read DB: file does not exist."
-        return base_response
-
     try:
-        conn = get_read_connection(str(db_file))
-    except sqlite3.Error as exc:
+        conn = get_connection()
+    except Exception as exc:
         base_response["overall"]["message"] = f"Dashboard cannot read DB: {exc}"
         return base_response
 
     try:
-        if not tables_exist(conn):
+        if not REQUIRED_TABLES.issubset(get_tables(conn)):
             base_response["overall"]["message"] = "Database is missing required collector tables."
             return base_response
 
-        enabled_machine_count = get_enabled_machine_count(conn)
-        enabled_tag_count = get_enabled_tag_count(conn)
+        stats = get_db_stats(conn=conn)
         latest_poll = get_latest_poll_run(conn)
-        storage_stats = get_storage_stats(conn, db_file)
-        recent_cutoff_utc = (generated_at - timedelta(seconds=RECENT_WINDOW_SECONDS)).replace(microsecond=0)
-        recent_cutoff_iso = recent_cutoff_utc.isoformat()
-        recent_sample_totals = get_recent_sample_totals(conn, recent_cutoff_iso)
+        recent_cutoff = generated_at - timedelta(seconds=RECENT_WINDOW_SECONDS)
+        recent_sample_totals = get_recent_sample_totals(conn, recent_cutoff)
         machines = get_machine_status_rows(
             conn,
             generated_at,
-            recent_cutoff_iso,
+            recent_cutoff,
             use_machine_poll_runs=table_exists(conn, "machine_poll_runs"),
         )
         recent_polls = get_recent_poll_runs(conn, generated_at)
         recent_errors = get_recent_errors(conn, generated_at)
 
         overall = base_response["overall"]
-        overall["last_poll_finished_at_utc"] = latest_poll["finished_at_utc"] if latest_poll else None
-        overall["last_poll_age_seconds"] = (
-            round(age_seconds(latest_poll["finished_at_utc"], generated_at), 1)
-            if latest_poll and latest_poll["finished_at_utc"]
-            else None
-        )
-        overall["db_size_mb"] = storage_stats["db_size_mb"]
-        overall["total_enabled_machines"] = enabled_machine_count
-        overall["total_enabled_tags"] = enabled_tag_count
-        overall["total_sample_rows"] = storage_stats["total_sample_rows"]
-        overall["total_good_sample_rows"] = storage_stats["total_good_sample_rows"]
-        overall["total_bad_sample_rows"] = storage_stats["total_bad_sample_rows"]
-        overall["oldest_sample_utc"] = storage_stats["oldest_sample_utc"]
-        overall["newest_sample_utc"] = storage_stats["newest_sample_utc"]
-        overall["poll_run_count"] = storage_stats["poll_run_count"]
+        overall["db_size_mb"] = stats["db_size_mb"]
+        overall["total_enabled_machines"] = stats["enabled_machine_count"]
+        overall["total_enabled_tags"] = stats["enabled_tag_count"]
+        overall["total_sample_rows"] = stats["total_sample_rows"]
+        overall["total_good_sample_rows"] = stats["good_sample_rows"]
+        overall["total_bad_sample_rows"] = stats["bad_sample_rows"]
+        overall["oldest_sample_utc"] = stats["oldest_sampled_at_utc"]
+        overall["newest_sample_utc"] = stats["newest_sampled_at_utc"]
+        overall["poll_run_count"] = stats["total_poll_runs"]
         overall["recent_good_samples"] = recent_sample_totals["good"]
         overall["recent_bad_samples"] = recent_sample_totals["bad"]
-        overall["latest_poll_duration_seconds"] = (
-            latest_poll["duration_seconds"] if latest_poll else None
-        )
+
+        if latest_poll:
+            overall["last_poll_finished_at_utc"] = to_iso_utc(latest_poll["finished_at_utc"])
+            overall["last_poll_age_seconds"] = round(
+                age_seconds(latest_poll["finished_at_utc"], generated_at) or 0.0,
+                1,
+            )
+            overall["latest_poll_duration_seconds"] = float(latest_poll["duration_seconds"] or 0.0)
 
         overall_status, overall_message = determine_overall_status(
             machines=machines,
             latest_poll_finished_at_utc=overall["last_poll_finished_at_utc"],
             latest_poll_age_seconds=overall["last_poll_age_seconds"],
-            enabled_machine_count=enabled_machine_count,
+            enabled_machine_count=stats["enabled_machine_count"],
         )
         overall["status"] = overall_status
         overall["message"] = overall_message
-
         base_response["machines"] = machines
         base_response["recent_poll_runs"] = recent_polls
         base_response["recent_errors"] = recent_errors
         return base_response
-    except sqlite3.Error as exc:
+    except Exception as exc:
         base_response["overall"]["message"] = f"Dashboard query failure: {exc}"
         return base_response
     finally:
         conn.close()
 
 
-def get_enabled_machine_count(conn: sqlite3.Connection) -> int:
-    row = conn.execute("SELECT COUNT(*) AS count FROM machines WHERE enabled = 1").fetchone()
-    return int(row["count"]) if row else 0
+def get_latest_poll_run(conn: Connection) -> dict[str, Any] | None:
+    with conn.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT started_at_utc, finished_at_utc, duration_seconds, machines_attempted, machines_ok,
+                   machines_failed, tags_attempted, tags_ok, tags_failed
+            FROM poll_runs
+            ORDER BY COALESCE(finished_at_utc, started_at_utc) DESC
+            LIMIT 1
+            """
+        )
+        return cursor.fetchone()
 
 
-def get_enabled_tag_count(conn: sqlite3.Connection) -> int:
-    row = conn.execute("SELECT COUNT(*) AS count FROM tags WHERE enabled = 1").fetchone()
-    return int(row["count"]) if row else 0
-
-
-def get_storage_stats(conn: sqlite3.Connection, db_file: Path) -> dict[str, Any]:
-    sample_row = conn.execute(
-        """
-        SELECT
-            COUNT(*) AS total_sample_rows,
-            COALESCE(SUM(CASE WHEN quality = 'good' THEN 1 ELSE 0 END), 0) AS total_good_sample_rows,
-            COALESCE(SUM(CASE WHEN quality = 'bad' THEN 1 ELSE 0 END), 0) AS total_bad_sample_rows,
-            MIN(ts_utc) AS oldest_sample_utc,
-            MAX(ts_utc) AS newest_sample_utc
-        FROM tag_samples
-        """
-    ).fetchone()
-    poll_row = conn.execute("SELECT COUNT(*) AS poll_run_count FROM poll_runs").fetchone()
-    db_size_bytes = db_file.stat().st_size if db_file.exists() else 0
-    return {
-        "db_size_mb": round(db_size_bytes / (1024 * 1024), 2),
-        "total_sample_rows": int(sample_row["total_sample_rows"]) if sample_row else 0,
-        "total_good_sample_rows": int(sample_row["total_good_sample_rows"]) if sample_row else 0,
-        "total_bad_sample_rows": int(sample_row["total_bad_sample_rows"]) if sample_row else 0,
-        "oldest_sample_utc": sample_row["oldest_sample_utc"] if sample_row else None,
-        "newest_sample_utc": sample_row["newest_sample_utc"] if sample_row else None,
-        "poll_run_count": int(poll_row["poll_run_count"]) if poll_row else 0,
-    }
-
-
-def get_latest_poll_run(conn: sqlite3.Connection) -> sqlite3.Row | None:
-    return conn.execute(
-        """
-        SELECT started_at_utc, finished_at_utc, duration_seconds, machines_attempted, machines_ok,
-               machines_failed, tags_attempted, tags_ok, tags_failed
-        FROM poll_runs
-        ORDER BY COALESCE(finished_at_utc, started_at_utc) DESC
-        LIMIT 1
-        """
-    ).fetchone()
-
-
-def get_recent_sample_totals(conn: sqlite3.Connection, recent_cutoff_iso: str) -> dict[str, int]:
-    row = conn.execute(
-        """
-        SELECT
-            COALESCE(SUM(CASE WHEN quality = 'good' AND ts_utc >= ? THEN 1 ELSE 0 END), 0) AS good,
-            COALESCE(SUM(CASE WHEN quality = 'bad' AND ts_utc >= ? THEN 1 ELSE 0 END), 0) AS bad
-        FROM tag_samples
-        """,
-        (recent_cutoff_iso, recent_cutoff_iso),
-    ).fetchone()
-    return {
-        "good": int(row["good"]) if row else 0,
-        "bad": int(row["bad"]) if row else 0,
-    }
+def get_recent_sample_totals(conn: Connection, recent_cutoff: datetime) -> dict[str, int]:
+    cutoff = to_db_datetime(recent_cutoff)
+    with conn.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT
+                COALESCE(SUM(CASE WHEN quality = 'good' AND sampled_at_utc >= %s THEN 1 ELSE 0 END), 0) AS good,
+                COALESCE(SUM(CASE WHEN quality <> 'good' AND sampled_at_utc >= %s THEN 1 ELSE 0 END), 0) AS bad
+            FROM tag_samples
+            """,
+            (cutoff, cutoff),
+        )
+        row = cursor.fetchone()
+    return {"good": int(row["good"] or 0), "bad": int(row["bad"] or 0)}
 
 
 def get_machine_status_rows(
-    conn: sqlite3.Connection,
+    conn: Connection,
     now_utc: datetime,
-    recent_cutoff_iso: str,
+    recent_cutoff: datetime,
     use_machine_poll_runs: bool,
 ) -> list[dict[str, Any]]:
-    rows = conn.execute(
-        f"""
+    sql = f"""
         WITH enabled_machines AS (
             SELECT id, machine_name, endpoint_url
             FROM machines
@@ -262,12 +187,12 @@ def get_machine_status_rows(
             GROUP BY machine_id
         ),
         latest_samples AS (
-            SELECT machine_id, MAX(ts_utc) AS latest_sample_utc
+            SELECT machine_id, MAX(sampled_at_utc) AS latest_sample_utc
             FROM tag_samples
             GROUP BY machine_id
         ),
         latest_good_samples AS (
-            SELECT machine_id, MAX(ts_utc) AS latest_good_sample_utc
+            SELECT machine_id, MAX(sampled_at_utc) AS latest_good_sample_utc
             FROM tag_samples
             WHERE quality = 'good'
             GROUP BY machine_id
@@ -275,9 +200,9 @@ def get_machine_status_rows(
         recent_counts AS (
             SELECT
                 machine_id,
-                SUM(CASE WHEN quality = 'good' AND ts_utc >= ? THEN 1 ELSE 0 END) AS recent_good_samples,
-                SUM(CASE WHEN quality = 'bad' AND ts_utc >= ? THEN 1 ELSE 0 END) AS recent_bad_samples,
-                SUM(CASE WHEN ts_utc >= ? THEN 1 ELSE 0 END) AS recent_total_samples
+                SUM(CASE WHEN quality = 'good' AND sampled_at_utc >= %s THEN 1 ELSE 0 END) AS recent_good_samples,
+                SUM(CASE WHEN quality <> 'good' AND sampled_at_utc >= %s THEN 1 ELSE 0 END) AS recent_bad_samples,
+                SUM(CASE WHEN sampled_at_utc >= %s THEN 1 ELSE 0 END) AS recent_total_samples
             FROM tag_samples
             GROUP BY machine_id
         ),
@@ -285,20 +210,19 @@ def get_machine_status_rows(
             SELECT
                 ts.machine_id,
                 ts.error_text,
-                ts.ts_utc,
+                ts.sampled_at_utc,
                 ROW_NUMBER() OVER (
                     PARTITION BY ts.machine_id
-                    ORDER BY ts.ts_utc DESC, ts.id DESC
+                    ORDER BY ts.sampled_at_utc DESC, ts.id DESC
                 ) AS rn
             FROM tag_samples ts
-            WHERE ts.quality = 'bad' AND ts.error_text IS NOT NULL AND ts.error_text <> ''
+            WHERE ts.quality <> 'good' AND ts.error_text IS NOT NULL AND ts.error_text <> ''
         ),
         latest_machine_poll_runs AS (
             SELECT
                 mpr.machine_id,
                 mpr.finished_at_utc,
                 mpr.tags_attempted,
-                mpr.tags_ok,
                 mpr.tags_failed,
                 mpr.connection_ok,
                 mpr.error_text,
@@ -319,24 +243,27 @@ def get_machine_status_rows(
             COALESCE(rc.recent_bad_samples, 0) AS recent_bad_samples,
             COALESCE(rc.recent_total_samples, 0) AS recent_total_samples,
             rec.error_text AS top_recent_error,
-            { "mpr.finished_at_utc AS last_machine_poll_finished_at_utc," if use_machine_poll_runs else "NULL AS last_machine_poll_finished_at_utc," }
-            { "mpr.tags_attempted AS last_poll_attempted_tags," if use_machine_poll_runs else "NULL AS last_poll_attempted_tags," }
-            { "mpr.tags_failed AS last_poll_failed_tags," if use_machine_poll_runs else "NULL AS last_poll_failed_tags," }
-            { "mpr.connection_ok AS last_poll_connection_ok," if use_machine_poll_runs else "NULL AS last_poll_connection_ok," }
-            { "mpr.error_text AS last_poll_error_text" if use_machine_poll_runs else "NULL AS last_poll_error_text" }
+            {"mpr.tags_attempted AS last_poll_attempted_tags," if use_machine_poll_runs else "NULL AS last_poll_attempted_tags,"}
+            {"mpr.tags_failed AS last_poll_failed_tags," if use_machine_poll_runs else "NULL AS last_poll_failed_tags,"}
+            {"mpr.connection_ok AS last_poll_connection_ok," if use_machine_poll_runs else "NULL AS last_poll_connection_ok,"}
+            {"mpr.error_text AS last_poll_error_text" if use_machine_poll_runs else "NULL AS last_poll_error_text"}
         FROM enabled_machines m
         LEFT JOIN enabled_tags t ON t.machine_id = m.id
         LEFT JOIN latest_samples ls ON ls.machine_id = m.id
         LEFT JOIN latest_good_samples lgs ON lgs.machine_id = m.id
         LEFT JOIN recent_counts rc ON rc.machine_id = m.id
         LEFT JOIN recent_error_candidates rec ON rec.machine_id = m.id AND rec.rn = 1
-        { "LEFT JOIN latest_machine_poll_runs mpr ON mpr.machine_id = m.id AND mpr.rn = 1" if use_machine_poll_runs else "" }
+        {"LEFT JOIN latest_machine_poll_runs mpr ON mpr.machine_id = m.id AND mpr.rn = 1" if use_machine_poll_runs else ""}
         ORDER BY m.machine_name
-        """,
-        (recent_cutoff_iso, recent_cutoff_iso, recent_cutoff_iso),
-    ).fetchall()
+    """
+    with conn.cursor() as cursor:
+        cursor.execute(
+            sql,
+            (to_db_datetime(recent_cutoff), to_db_datetime(recent_cutoff), to_db_datetime(recent_cutoff)),
+        )
+        rows = cursor.fetchall()
 
-    machine_rows: list[dict[str, Any]] = []
+    results: list[dict[str, Any]] = []
     for row in rows:
         latest_good_age = age_seconds(row["latest_good_sample_utc"], now_utc)
         latest_sample_age = age_seconds(row["latest_sample_utc"], now_utc)
@@ -352,16 +279,16 @@ def get_machine_status_rows(
             last_poll_connection_ok=row["last_poll_connection_ok"],
             last_poll_error_text=row["last_poll_error_text"],
         )
-        machine_rows.append(
+        results.append(
             {
                 "machine_name": row["machine_name"],
                 "endpoint_url": row["endpoint_url"],
                 "status": status,
                 "status_reason": reason,
                 "enabled_tags": int(row["enabled_tags"] or 0),
-                "latest_sample_utc": row["latest_sample_utc"],
+                "latest_sample_utc": to_iso_utc(row["latest_sample_utc"]),
                 "latest_sample_age_seconds": round(latest_sample_age, 1) if latest_sample_age is not None else None,
-                "latest_good_sample_utc": row["latest_good_sample_utc"],
+                "latest_good_sample_utc": to_iso_utc(row["latest_good_sample_utc"]),
                 "latest_good_age_seconds": round(latest_good_age, 1) if latest_good_age is not None else None,
                 "recent_good_samples": recent_good,
                 "recent_bad_samples": recent_bad,
@@ -370,10 +297,9 @@ def get_machine_status_rows(
                 "last_poll_attempted_tags": int(row["last_poll_attempted_tags"] or row["enabled_tags"] or 0),
                 "last_poll_failed_tags": int(row["last_poll_failed_tags"] or 0),
                 "top_recent_error": row["last_poll_error_text"] or row["top_recent_error"],
-                "last_updated_display": row["latest_sample_utc"] or "Never",
             }
         )
-    return machine_rows
+    return results
 
 
 def determine_machine_status(
@@ -409,7 +335,6 @@ def determine_overall_status(
         return ("CRITICAL", "No poll history available yet.")
     if latest_poll_age_seconds is None or latest_poll_age_seconds > STALE_THRESHOLD_SECONDS:
         return ("CRITICAL", "Latest poll is stale.")
-
     statuses = {machine["status"] for machine in machines}
     if "CRITICAL" in statuses:
         return ("CRITICAL", "One or more machines are critical.")
@@ -418,80 +343,82 @@ def determine_overall_status(
     return ("GOOD", "All enabled machines have healthy recent inserts.")
 
 
-def get_recent_poll_runs(conn: sqlite3.Connection, now_utc: datetime) -> list[dict[str, Any]]:
-    rows = conn.execute(
-        """
-        SELECT started_at_utc, finished_at_utc, duration_seconds, machines_attempted, machines_ok,
-               machines_failed, tags_attempted, tags_ok, tags_failed
-        FROM poll_runs
-        ORDER BY COALESCE(finished_at_utc, started_at_utc) DESC
-        LIMIT ?
-        """,
-        (RECENT_POLL_LIMIT,),
-    ).fetchall()
-    result: list[dict[str, Any]] = []
-    for row in rows:
-        result.append(
-            {
-                "started_at_utc": row["started_at_utc"],
-                "finished_at_utc": row["finished_at_utc"],
-                "finished_age_seconds": round(age_seconds(row["finished_at_utc"], now_utc), 1)
-                if row["finished_at_utc"]
-                else None,
-                "duration_seconds": row["duration_seconds"],
-                "machines_attempted": int(row["machines_attempted"] or 0),
-                "machines_ok": int(row["machines_ok"] or 0),
-                "machines_failed": int(row["machines_failed"] or 0),
-                "tags_attempted": int(row["tags_attempted"] or 0),
-                "tags_ok": int(row["tags_ok"] or 0),
-                "tags_failed": int(row["tags_failed"] or 0),
-            }
+def get_recent_poll_runs(conn: Connection, now_utc: datetime) -> list[dict[str, Any]]:
+    with conn.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT started_at_utc, finished_at_utc, duration_seconds, machines_attempted, machines_ok,
+                   machines_failed, tags_attempted, tags_ok, tags_failed
+            FROM poll_runs
+            ORDER BY COALESCE(finished_at_utc, started_at_utc) DESC
+            LIMIT %s
+            """,
+            (RECENT_POLL_LIMIT,),
         )
-    return result
+        rows = cursor.fetchall()
+    return [
+        {
+            "started_at_utc": to_iso_utc(row["started_at_utc"]),
+            "finished_at_utc": to_iso_utc(row["finished_at_utc"]),
+            "finished_age_seconds": round(age_seconds(row["finished_at_utc"], now_utc) or 0.0, 1)
+            if row["finished_at_utc"]
+            else None,
+            "duration_seconds": float(row["duration_seconds"] or 0.0) if row["duration_seconds"] is not None else None,
+            "machines_attempted": int(row["machines_attempted"] or 0),
+            "machines_ok": int(row["machines_ok"] or 0),
+            "machines_failed": int(row["machines_failed"] or 0),
+            "tags_attempted": int(row["tags_attempted"] or 0),
+            "tags_ok": int(row["tags_ok"] or 0),
+            "tags_failed": int(row["tags_failed"] or 0),
+        }
+        for row in rows
+    ]
 
 
-def get_recent_errors(conn: sqlite3.Connection, now_utc: datetime) -> list[dict[str, Any]]:
-    rows = conn.execute(
-        """
-        WITH recent_errors AS (
+def get_recent_errors(conn: Connection, now_utc: datetime) -> list[dict[str, Any]]:
+    with conn.cursor() as cursor:
+        cursor.execute(
+            """
+            WITH recent_errors AS (
+                SELECT
+                    ts.id,
+                    ts.sampled_at_utc,
+                    ts.machine_id,
+                    ts.tag_id,
+                    ts.error_text,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY ts.machine_id, ts.tag_id, ts.error_text
+                        ORDER BY ts.sampled_at_utc DESC, ts.id DESC
+                    ) AS rn
+                FROM tag_samples ts
+                WHERE ts.quality <> 'good' AND ts.error_text IS NOT NULL AND ts.error_text <> ''
+            )
             SELECT
-                ts.id,
-                ts.ts_utc,
-                ts.machine_id,
-                ts.tag_id,
-                ts.error_text,
-                ROW_NUMBER() OVER (
-                    PARTITION BY ts.machine_id, ts.tag_id, ts.error_text
-                    ORDER BY ts.ts_utc DESC, ts.id DESC
-                ) AS rn
-            FROM tag_samples ts
-            WHERE ts.quality = 'bad' AND ts.error_text IS NOT NULL AND ts.error_text <> ''
+                re.sampled_at_utc,
+                m.machine_name,
+                COALESCE(t.display_name, t.browse_name, t.node_id) AS tag_name,
+                t.node_id,
+                re.error_text
+            FROM recent_errors re
+            JOIN machines m ON m.id = re.machine_id
+            JOIN tags t ON t.id = re.tag_id
+            WHERE re.rn = 1
+            ORDER BY re.sampled_at_utc DESC
+            LIMIT %s
+            """,
+            (RECENT_ERROR_LIMIT,),
         )
-        SELECT
-            re.ts_utc,
-            m.machine_name,
-            COALESCE(t.display_name, t.browse_name, t.node_id) AS tag_name,
-            t.node_id,
-            re.error_text
-        FROM recent_errors re
-        JOIN machines m ON m.id = re.machine_id
-        JOIN tags t ON t.id = re.tag_id
-        WHERE re.rn = 1
-        ORDER BY re.ts_utc DESC
-        LIMIT ?
-        """,
-        (RECENT_ERROR_LIMIT,),
-    ).fetchall()
-    result: list[dict[str, Any]] = []
-    for row in rows:
-        result.append(
-            {
-                "timestamp_utc": row["ts_utc"],
-                "age_seconds": round(age_seconds(row["ts_utc"], now_utc), 1) if row["ts_utc"] else None,
-                "machine_name": row["machine_name"],
-                "tag_name": row["tag_name"],
-                "node_id": row["node_id"],
-                "error_text": row["error_text"],
-            }
-        )
-    return result
+        rows = cursor.fetchall()
+    return [
+        {
+            "timestamp_utc": to_iso_utc(row["sampled_at_utc"]),
+            "age_seconds": round(age_seconds(row["sampled_at_utc"], now_utc) or 0.0, 1)
+            if row["sampled_at_utc"]
+            else None,
+            "machine_name": row["machine_name"],
+            "tag_name": row["tag_name"],
+            "node_id": row["node_id"],
+            "error_text": row["error_text"],
+        }
+        for row in rows
+    ]

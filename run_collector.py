@@ -8,9 +8,8 @@ from logging.handlers import RotatingFileHandler
 from filelock import FileLock, Timeout
 
 from collector import build_arg_parser, collector_loop
-from config import COLLECTOR_LOCK_PATH, LOGS_DIR, SQLITE_DB_PATH, get_all_machine_configs
+from config import COLLECTOR_LOCK_PATH, LOGS_DIR, get_all_machine_configs
 from db import (
-    checkpoint_database,
     cleanup_old_data,
     clear_all_samples,
     clear_bad_samples,
@@ -18,7 +17,7 @@ from db import (
     clear_poll_runs,
     get_connection,
     get_db_stats,
-    initialize_database,
+    init_database,
 )
 from tag_loader import load_tag_files
 
@@ -44,12 +43,7 @@ def configure_logging() -> None:
     root_logger.addHandler(console_handler)
     root_logger.addHandler(file_handler)
 
-    for logger_name in (
-        "opcua",
-        "opcua.client",
-        "opcua.client.ua_client",
-        "opcua.uaprotocol",
-    ):
+    for logger_name in ("opcua", "opcua.client", "opcua.client.ua_client", "opcua.uaprotocol"):
         logging.getLogger(logger_name).setLevel(logging.WARNING)
 
 
@@ -65,30 +59,7 @@ def format_retry_command(argv: list[str]) -> str:
 
 
 def requires_confirmation(args) -> bool:
-    return any(
-        (
-            args.clear_poll_runs,
-            args.clear_bad_samples,
-            args.clear_all_samples,
-            args.clear_monitoring_data,
-        )
-    )
-
-
-def should_acquire_lock(args) -> bool:
-    return not any(
-        (
-            args.show_config,
-            args.init_only,
-            args.cleanup_now,
-            args.clear_poll_runs,
-            args.clear_bad_samples,
-            args.clear_all_samples,
-            args.clear_monitoring_data,
-            args.db_stats,
-            args.checkpoint_db,
-        )
-    )
+    return any((args.clear_poll_runs, args.clear_bad_samples, args.clear_all_samples, args.clear_monitoring_data))
 
 
 def show_config() -> int:
@@ -97,8 +68,7 @@ def show_config() -> int:
 
 
 def show_db_stats() -> int:
-    stats = get_db_stats()
-    print(json.dumps(stats, indent=2, sort_keys=True))
+    print(json.dumps(get_db_stats(), indent=2, sort_keys=True))
     return 0
 
 
@@ -110,58 +80,48 @@ def main() -> int:
     if args.show_config:
         return show_config()
 
-    conn = get_connection(SQLITE_DB_PATH)
+    conn = get_connection()
     try:
-        initialize_database(conn)
-        load_tag_files(conn)
+        init_database(conn)
+
+        if args.init_db:
+            LOGGER.info("Database schema initialization complete")
+            return 0
 
         if args.db_stats:
             return show_db_stats()
 
         if args.cleanup_now:
-            results = cleanup_old_data(conn=conn)
-            LOGGER.info("Cleanup finished: %s", results)
-            return 0
-
-        if args.checkpoint_db:
-            checkpoint_mode = "TRUNCATE" if args.truncate else "PASSIVE"
-            if args.truncate:
-                LOGGER.warning("Running TRUNCATE checkpoint; prefer collector stopped before using this mode.")
-            result = checkpoint_database(conn=conn, mode=checkpoint_mode)
-            LOGGER.info("Checkpoint finished: %s", result)
-            print(json.dumps(result, indent=2, sort_keys=True))
+            LOGGER.info("Cleanup finished: %s", cleanup_old_data(conn=conn))
             return 0
 
         if requires_confirmation(args) and not args.yes:
-            retry_command = format_retry_command(sys.argv)
-            print(f"Refusing destructive command without --yes.\nRetry with:\n{retry_command}")
+            print(f"Refusing destructive command without --yes.\nRetry with:\n{format_retry_command(sys.argv)}")
             return 2
 
         if args.clear_poll_runs:
-            deleted = clear_poll_runs(conn=conn)
-            LOGGER.warning("Cleared poll_runs deleted=%s", deleted)
+            LOGGER.warning("Cleared poll_runs deleted=%s", clear_poll_runs(conn=conn))
             return 0
 
         if args.clear_bad_samples:
-            deleted = clear_bad_samples(conn=conn)
-            LOGGER.warning("Cleared bad tag_samples deleted=%s", deleted)
+            LOGGER.warning("Cleared bad tag_samples deleted=%s", clear_bad_samples(conn=conn))
             return 0
 
         if args.clear_all_samples:
-            deleted = clear_all_samples(conn=conn)
-            LOGGER.warning("Cleared all tag_samples deleted=%s", deleted)
+            LOGGER.warning("Cleared all tag_samples deleted=%s", clear_all_samples(conn=conn))
             return 0
 
         if args.clear_monitoring_data:
-            deleted = clear_monitoring_data(conn=conn)
-            LOGGER.warning("Cleared monitoring data: %s", deleted)
+            LOGGER.warning("Cleared monitoring data: %s", clear_monitoring_data(conn=conn))
             return 0
+
+        load_tag_files(conn)
 
         if args.init_only:
             LOGGER.info("Initialization complete; skipping polling due to --init-only")
             return 0
 
-        if should_acquire_lock(args) and not args.allow_multiple:
+        if not args.allow_multiple:
             lock = FileLock(COLLECTOR_LOCK_PATH)
             try:
                 with lock.acquire(timeout=0):
@@ -173,9 +133,7 @@ def main() -> int:
                         machine_name=args.machine,
                     )
             except Timeout:
-                LOGGER.error(
-                    "Another collector instance appears to be running. Use --allow-multiple only if duplicate polling is intentional."
-                )
+                LOGGER.error("Another collector instance appears to be running. Use --allow-multiple only if duplicate polling is intentional.")
                 return 1
         else:
             collector_loop(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from copy import deepcopy
 from pathlib import Path
 
@@ -7,8 +8,18 @@ BASE_DIR = Path(__file__).resolve().parent
 TAG_FILES_DIR = BASE_DIR / "Tag_Files"
 DATA_DIR = BASE_DIR / "data"
 LOGS_DIR = BASE_DIR / "logs"
-SQLITE_DB_PATH = DATA_DIR / "opcua_history.sqlite3"
 COLLECTOR_LOCK_PATH = DATA_DIR / "collector.lock"
+
+MYSQL_HOST = os.getenv("MYSQL_HOST", "127.0.0.1")
+MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
+MYSQL_USER = os.getenv("MYSQL_USER", "root")
+MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "")
+MYSQL_DATABASE = os.getenv("MYSQL_DATABASE", "opcua_collector")
+MYSQL_CHARSET = "utf8mb4"
+MYSQL_CONNECT_TIMEOUT_SECONDS = int(os.getenv("MYSQL_CONNECT_TIMEOUT_SECONDS", "10"))
+MYSQL_READ_TIMEOUT_SECONDS = int(os.getenv("MYSQL_READ_TIMEOUT_SECONDS", "30"))
+MYSQL_WRITE_TIMEOUT_SECONDS = int(os.getenv("MYSQL_WRITE_TIMEOUT_SECONDS", "30"))
+MYSQL_SSL_CA = os.getenv("MYSQL_SSL_CA", "").strip()
 
 DEFAULT_POLL_INTERVAL_SECONDS = 60
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 10.0
@@ -17,7 +28,6 @@ DEFAULT_TAG_FAILURE_LOG_SAMPLE = 5
 SAMPLE_RETENTION_DAYS = 14
 BAD_SAMPLE_RETENTION_DAYS = 60
 POLL_RUN_RETENTION_DAYS = 14
-VACUUM_AFTER_DELETE = False
 CLEANUP_INTERVAL_MINUTES = 60
 
 AUTH_MODE_ANONYMOUS = "anonymous"
@@ -34,9 +44,9 @@ DEFAULT_MACHINE_NAMES = [
     "Pinch 21",
 ]
 
-# Pinch 20 is a B&R server that uses an unsecured channel plus an encrypted
-# Basic256 username token with a blank password. No client cert/key files are
-# required because security_string remains blank.
+# Pinch 20 is a B&R server that uses Channel SecurityPolicy None with a blank
+# security_string, plus an encrypted Basic256 username token carrying a blank
+# password. No client certificate files are required for this flow.
 MACHINE_AUTH_CONFIG: dict[str, dict[str, object]] = {
     "Pinch 16": {
         "auth_mode": AUTH_MODE_ANONYMOUS,
@@ -75,6 +85,24 @@ MACHINE_AUTH_CONFIG: dict[str, dict[str, object]] = {
         "endpoint_url": None,
     },
 }
+
+
+def get_mysql_connection_kwargs(database: str | None = None) -> dict[str, object]:
+    kwargs: dict[str, object] = {
+        "host": MYSQL_HOST,
+        "port": MYSQL_PORT,
+        "user": MYSQL_USER,
+        "password": MYSQL_PASSWORD,
+        "database": database or MYSQL_DATABASE,
+        "charset": MYSQL_CHARSET,
+        "connect_timeout": MYSQL_CONNECT_TIMEOUT_SECONDS,
+        "read_timeout": MYSQL_READ_TIMEOUT_SECONDS,
+        "write_timeout": MYSQL_WRITE_TIMEOUT_SECONDS,
+        "autocommit": False,
+    }
+    if MYSQL_SSL_CA:
+        kwargs["ssl"] = {"ca": MYSQL_SSL_CA}
+    return kwargs
 
 
 def _normalize_endpoint(value: object) -> str | None:

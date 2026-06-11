@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import csv
 import logging
-import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from config import (
     AUTH_MODE_ANONYMOUS,
@@ -12,7 +12,7 @@ from config import (
     TAG_FILES_DIR,
     get_machine_config,
 )
-from db import transaction
+from db import Connection, to_db_datetime, transaction, utc_now
 
 LOGGER = logging.getLogger(__name__)
 
@@ -45,7 +45,7 @@ def discover_csv_files(tag_files_dir: Path = TAG_FILES_DIR) -> list[Path]:
     return sorted(tag_files_dir.glob(CSV_GLOB))
 
 
-def load_tag_files(conn: sqlite3.Connection, tag_files_dir: Path = TAG_FILES_DIR) -> list[MachineImportSummary]:
+def load_tag_files(conn: Connection, tag_files_dir: Path = TAG_FILES_DIR) -> list[MachineImportSummary]:
     csv_files = discover_csv_files(tag_files_dir)
     if not csv_files:
         raise FileNotFoundError(f"No CSV files matching {CSV_GLOB} found in {tag_files_dir}")
@@ -59,28 +59,41 @@ def load_tag_files(conn: sqlite3.Connection, tag_files_dir: Path = TAG_FILES_DIR
     return summaries
 
 
-def _ensure_default_machines(conn: sqlite3.Connection) -> None:
+def _ensure_default_machines(conn: Connection) -> None:
+    now_dt = to_db_datetime(utc_now())
     for machine_name in DEFAULT_MACHINE_NAMES:
         resolved = get_machine_config(machine_name)
-        conn.execute(
-            """
-            INSERT INTO machines (machine_name, endpoint_url, auth_mode, enabled, created_at)
-            VALUES (?, ?, ?, ?, datetime('now'))
-            ON CONFLICT(machine_name) DO UPDATE SET
-                auth_mode = excluded.auth_mode,
-                enabled = excluded.enabled,
-                endpoint_url = COALESCE(machines.endpoint_url, excluded.endpoint_url)
-            """,
-            (
-                machine_name,
-                resolved.get("endpoint_url"),
-                resolved.get("auth_mode", AUTH_MODE_ANONYMOUS),
-                1 if resolved.get("enabled", True) else 0,
-            ),
-        )
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO machines (
+                    machine_name,
+                    endpoint_url,
+                    auth_mode,
+                    enabled,
+                    created_at_utc,
+                    updated_at_utc
+                )
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    id = LAST_INSERT_ID(id),
+                    endpoint_url = COALESCE(VALUES(endpoint_url), endpoint_url),
+                    auth_mode = VALUES(auth_mode),
+                    enabled = VALUES(enabled),
+                    updated_at_utc = VALUES(updated_at_utc)
+                """,
+                (
+                    machine_name,
+                    resolved.get("endpoint_url") or "",
+                    resolved.get("auth_mode", AUTH_MODE_ANONYMOUS),
+                    1 if resolved.get("enabled", True) else 0,
+                    now_dt,
+                    now_dt,
+                ),
+            )
 
 
-def _import_csv_file(conn: sqlite3.Connection, csv_file: Path) -> list[MachineImportSummary]:
+def _import_csv_file(conn: Connection, csv_file: Path) -> list[MachineImportSummary]:
     summaries: dict[str, MachineImportSummary] = {}
     with csv_file.open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
@@ -108,62 +121,80 @@ def _import_csv_file(conn: sqlite3.Connection, csv_file: Path) -> list[MachineIm
     return list(summaries.values())
 
 
-def _upsert_machine(conn: sqlite3.Connection, machine_name: str, endpoint_url: str | None) -> int:
+def _upsert_machine(conn: Connection, machine_name: str, endpoint_url: str | None) -> int:
     resolved = get_machine_config(machine_name, endpoint_url)
-    final_endpoint = resolved.get("endpoint_url")
+    final_endpoint = resolved.get("endpoint_url") or ""
     auth_mode = str(resolved.get("auth_mode", AUTH_MODE_ANONYMOUS))
     enabled = 1 if resolved.get("enabled", True) else 0
+    now_dt = to_db_datetime(utc_now())
 
-    conn.execute(
-        """
-        INSERT INTO machines (machine_name, endpoint_url, auth_mode, enabled, created_at)
-        VALUES (?, ?, ?, ?, datetime('now'))
-        ON CONFLICT(machine_name) DO UPDATE SET
-            endpoint_url = COALESCE(excluded.endpoint_url, machines.endpoint_url),
-            auth_mode = excluded.auth_mode,
-            enabled = excluded.enabled
-        """,
-        (machine_name, final_endpoint, auth_mode, enabled),
-    )
-
-    row = conn.execute(
-        "SELECT id FROM machines WHERE machine_name = ?",
-        (machine_name,),
-    ).fetchone()
-    if row is None:
-        raise RuntimeError(f"Failed to load machine row for {machine_name}")
-    return int(row["id"])
-
-
-def _upsert_tag(conn: sqlite3.Connection, machine_id: int, row: dict[str, str]) -> None:
-    conn.execute(
-        """
-        INSERT INTO tags (
-            machine_id,
-            node_id,
-            opc_path,
-            display_name,
-            browse_name,
-            data_type,
-            parent_branch,
-            enabled,
-            created_at
+    with conn.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO machines (
+                machine_name,
+                endpoint_url,
+                auth_mode,
+                enabled,
+                created_at_utc,
+                updated_at_utc
+            )
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                id = LAST_INSERT_ID(id),
+                endpoint_url = COALESCE(NULLIF(VALUES(endpoint_url), ''), endpoint_url),
+                auth_mode = VALUES(auth_mode),
+                enabled = VALUES(enabled),
+                updated_at_utc = VALUES(updated_at_utc)
+            """,
+            (
+                machine_name,
+                final_endpoint,
+                auth_mode,
+                enabled,
+                now_dt,
+                now_dt,
+            ),
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, 1, datetime('now'))
-        ON CONFLICT(machine_id, node_id) DO UPDATE SET
-            opc_path = excluded.opc_path,
-            display_name = excluded.display_name,
-            browse_name = excluded.browse_name,
-            data_type = excluded.data_type,
-            parent_branch = excluded.parent_branch
-        """,
-        (
-            machine_id,
-            _normalize(row.get("node_id")),
-            _normalize(row.get("opc_path")),
-            _normalize(row.get("display_name")),
-            _normalize(row.get("browse_name")),
-            _normalize(row.get("data_type")),
-            _normalize(row.get("parent_branch")),
-        ),
-    )
+        return int(cursor.lastrowid)
+
+
+def _upsert_tag(conn: Connection, machine_id: int, row: dict[str, str]) -> None:
+    now_dt = to_db_datetime(utc_now())
+    with conn.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO tags (
+                machine_id,
+                node_id,
+                opc_path,
+                display_name,
+                browse_name,
+                data_type,
+                parent_branch,
+                enabled,
+                created_at_utc,
+                updated_at_utc
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, 1, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                id = LAST_INSERT_ID(id),
+                opc_path = VALUES(opc_path),
+                display_name = VALUES(display_name),
+                browse_name = VALUES(browse_name),
+                data_type = VALUES(data_type),
+                parent_branch = VALUES(parent_branch),
+                updated_at_utc = VALUES(updated_at_utc)
+            """,
+            (
+                machine_id,
+                _normalize(row.get("node_id")),
+                _normalize(row.get("opc_path")),
+                _normalize(row.get("display_name")),
+                _normalize(row.get("browse_name")),
+                _normalize(row.get("data_type")),
+                _normalize(row.get("parent_branch")),
+                now_dt,
+                now_dt,
+            ),
+        )

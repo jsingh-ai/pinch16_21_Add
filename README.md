@@ -1,13 +1,6 @@
-# OPC UA Polling Collector
+# OPC UA Collector With Azure MySQL
 
-This project imports discovered OPC UA tags from `Tag_Files/*.csv` and stores time-series samples in local SQLite at `data/opcua_history.sqlite3`.
-
-It is written to be Windows-compatible and does not rely on Linux-only shell features or filesystem paths.
-
-## Files
-
-- `Tag_Files/Pinch_16_opcua_discovered_tags.csv` through `Tag_Files/Pinch_21_opcua_discovered_tags.csv` are the input discovery files.
-- `data/opcua_history.sqlite3` is created automatically on initialization.
+This project polls OPC UA tags from Pinch 16 through Pinch 21 and stores one-minute history in Azure MySQL. The dashboard reads only from MySQL and converts UTC timestamps to US Central time for display.
 
 ## Install
 
@@ -15,82 +8,109 @@ It is written to be Windows-compatible and does not rely on Linux-only shell fea
 pip install -r requirements.txt
 ```
 
-On Windows, run the commands from `cmd.exe` or PowerShell with your virtual environment activated.
+Set MySQL connection environment variables before running:
 
-## Initialize Schema And Import Tags
+```bash
+set MYSQL_HOST=your-azure-mysql-host
+set MYSQL_PORT=3306
+set MYSQL_USER=your_user
+set MYSQL_PASSWORD=your_password
+set MYSQL_DATABASE=opcua_collector
+```
+
+On PowerShell use `$env:MYSQL_HOST="..."` style assignments instead.
+
+## Machine Auth Source Of Truth
+
+- `Pinch 16`: anonymous
+- `Pinch 17`: anonymous
+- `Pinch 18`: anonymous
+- `Pinch 19`: anonymous
+- `Pinch 20`: `username_blank_basic256_token`
+- `Pinch 21`: anonymous
+
+Pinch 20 details:
+
+- endpoint `opc.tcp://192.168.11.26:4840`
+- channel `SecurityPolicy None`
+- blank `security_string`
+- username `OpcUaViewer`
+- blank password `''`
+- user token `PolicyId='3'`
+- user token policy URI `http://opcfoundation.org/UA/SecurityPolicy#Basic256`
+- no client cert/key files required
+
+## Schema Design
+
+Tables:
+
+- `machines`: one row per physical machine
+- `tags`: one row per machine/node definition
+- `tag_samples`: append-only time-series rows
+- `poll_runs`: one row per collector cycle
+- `machine_poll_runs`: one row per machine per collector cycle
+
+Relationships:
+
+- `machines` 1-to-many `tags`
+- `machines` 1-to-many `tag_samples`
+- `tags` 1-to-many `tag_samples`
+- `poll_runs` 1-to-many `machine_poll_runs`
+
+All database timestamps are stored in UTC using `DATETIME(6)`.
+
+## Query Patterns
+
+Useful long-term query patterns this schema supports:
+
+- per-machine recent status:
+  use `machine_poll_runs` plus `tag_samples` recent counts
+- per-tag time series:
+  query `tag_samples` by `tag_id, sampled_at_utc`
+- machine-wide feature extraction by time window:
+  query `tag_samples` by `machine_id, sampled_at_utc`
+- bad sample and error analysis:
+  query `tag_samples` by `quality, sampled_at_utc` and `machine_id, quality, sampled_at_utc`
+
+## Initialization
+
+Create tables only:
+
+```bash
+python run_collector.py --init-db
+```
+
+Create tables and import tag definitions from `Tag_Files`:
 
 ```bash
 python run_collector.py --init-only
 ```
 
-## Show Config
+Show the resolved per-machine auth config:
 
 ```bash
 python run_collector.py --show-config
 ```
 
-## Run One Poll Cycle
+## Polling
+
+Run one machine once:
 
 ```bash
-python run_collector.py --once
+python run_collector.py --once --machine "Pinch 20" --no-sleep-align
 ```
 
-## Run Continuously
+Run the collector continuously:
 
 ```bash
 python run_collector.py
 ```
 
-The collector connects to each enabled machine once per poll cycle, reads that machine's enabled tags, inserts results into SQLite, disconnects cleanly, then sleeps until the next interval boundary. Stop it with `Ctrl+C`.
+Only one collector instance is allowed by default to avoid duplicate writes. Use `--allow-multiple` only if duplicate polling is intentional.
 
-By default only one collector instance is allowed at a time to prevent duplicate inserts. Use `--allow-multiple` only if duplicate polling is intentional.
+## Dashboard
 
-## CSV Location
-
-Place the OPC UA discovery CSV files in `Tag_Files/` with names matching `*_opcua_discovered_tags.csv`.
-
-## Machine Auth Configuration
-
-Per-machine auth and endpoint overrides live in `config.py` under `MACHINE_AUTH_CONFIG`.
-
-- `Pinch 16`, `Pinch 17`, `Pinch 18`, `Pinch 19`, and `Pinch 21` use anonymous auth.
-- `Pinch 20` uses the patched blank-password username token flow with:
-  - endpoint `opc.tcp://192.168.11.26:4840`
-  - channel `SecurityPolicy None`
-  - blank `security_string`
-  - username `OpcUaViewer`
-  - blank password `''`
-  - user token `PolicyId='3'`
-  - user token policy URI `http://opcfoundation.org/UA/SecurityPolicy#Basic256`
-- No client cert/key files are required for `Pinch 20`.
-- If `endpoint_url` is left as `None`, the importer uses the endpoint from the CSV.
-
-## Database Notes
-
-SQLite is configured with:
-
-- `PRAGMA journal_mode=WAL`
-- `PRAGMA synchronous=NORMAL`
-- `PRAGMA busy_timeout=5000`
-
-The schema includes `machines`, `tags`, `tag_samples`, `poll_runs`, and `machine_poll_runs`, plus indexes for common time-series queries.
-
-Keep the SQLite database on local disk. WAL mode should not be used from a network share.
-
-At about `3833` samples per minute, this collector produces roughly `5.52 million` samples per day. SQLite is acceptable for local/test retention windows, but PostgreSQL or MySQL is the better next stage for longer retention or higher sustained history volume.
-
-## Collector Dashboard
-
-Install dependencies, initialize the database if needed, run the collector, then start the dashboard:
-
-```bash
-pip install -r requirements.txt
-python run_collector.py --init-only
-python run_collector.py
-python dashboard_app.py --host 0.0.0.0 --port 5050
-```
-
-For a production-ish local VM deployment, prefer Waitress:
+Run the dashboard locally:
 
 ```bash
 python dashboard_app.py --host 0.0.0.0 --port 5050 --waitress
@@ -102,52 +122,73 @@ Then open:
 http://localhost:5050
 ```
 
-The dashboard reads only from SQLite and does not connect to OPC UA directly. It refreshes every 15 seconds and exposes a JSON status API at `/api/status`.
+The dashboard:
 
-Timestamps remain stored in UTC in SQLite, but the dashboard displays them in US Central time for operators.
+- reads only from MySQL
+- never connects to OPC UA
+- keeps DB timestamps in UTC
+- displays times in US Central time in the browser
+- includes maintenance buttons for cleanup and monitoring-data clears
 
-### Dashboard Maintenance Actions
+Expose the dashboard only on a trusted internal network because maintenance buttons are present.
 
-The dashboard includes maintenance buttons for running retention cleanup and clearing monitoring data. Run the dashboard only on a trusted internal network because those controls can trigger cleanup actions.
+## Retention And Cleanup
 
-- `Run cleanup now` calls the same retention cleanup used by the collector.
-- `Clear poll runs`, `Clear bad samples`, and `Clear monitoring data` require confirmation in the browser.
-- These dashboard maintenance actions do not delete `machines` or `tags`.
-- The Flask dev server is fine for local testing; Waitress is preferred if the dashboard stays running on the VM.
+Defaults:
 
-## Data Retention And Cleanup
+- good samples: 14 days
+- bad samples: 60 days
+- poll runs and machine poll runs: 14 days
+- machines and tags are never deleted by cleanup
 
-By default:
-
-- good samples are kept for 14 days
-- bad samples are kept for 60 days
-- `poll_runs` are kept for 14 days
-- `machines` and `tags` are never deleted by cleanup
-
-Automatic cleanup runs once at collector startup and then every 60 minutes while the collector is running. Cleanup uses SQL `DELETE` statements with timestamp cutoffs and does not load historical samples into Python memory.
-
-Manual cleanup commands are available, but destructive clear operations require `--yes`.
+Run cleanup manually:
 
 ```bash
 python run_collector.py --cleanup-now
+```
+
+Destructive clear commands require `--yes`:
+
+```bash
 python run_collector.py --clear-poll-runs --yes
 python run_collector.py --clear-bad-samples --yes
+python run_collector.py --clear-all-samples --yes
 python run_collector.py --clear-monitoring-data --yes
 ```
 
-## DB Health Tools
+## DB Stats And Health
+
+Connection smoke test:
 
 ```bash
-python run_collector.py --db-stats
-python run_collector.py --checkpoint-db
-python run_collector.py --checkpoint-db --truncate
+python test_mysql_connection.py
+```
+
+Schema/config smoke test:
+
+```bash
 python smoke_checks.py
 ```
 
-- `--db-stats` shows current size plus growth/retention math.
-- `--checkpoint-db` runs `PRAGMA wal_checkpoint(PASSIVE)`.
-- `--checkpoint-db --truncate` runs `PRAGMA wal_checkpoint(TRUNCATE)` and is best used while the collector is stopped.
+DB stats:
 
-## Future Migration
+```bash
+python run_collector.py --db-stats
+```
 
-To migrate later to PostgreSQL or MySQL, keep the same logical schema and replace the small SQLite access layer in `db.py` plus the SQL connection setup. The importer and collector logic are already separated from transport details, so the main change would be swapping the DB driver and adapting SQL parameter style or upsert syntax.
+At about `3833` samples per minute, the collector generates roughly `5.52 million` samples per day. The MySQL schema is designed to support dashboarding, cleanup, and future ML extraction, but long retention still requires capacity planning on the Azure MySQL tier.
+
+## ML Readiness Notes
+
+Each sample keeps:
+
+- `sampled_at_utc`
+- `source_timestamp_utc`
+- `server_timestamp_utc`
+- `value_numeric`
+- `value_text`
+- `quality`
+- `status_code`
+- `error_text`
+
+This keeps the schema simple while preserving enough metadata for later feature extraction and data-quality filtering.
