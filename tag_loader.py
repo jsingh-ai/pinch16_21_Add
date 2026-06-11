@@ -5,13 +5,12 @@ import logging
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 from config import (
     AUTH_MODE_ANONYMOUS,
     DEFAULT_MACHINE_NAMES,
-    MACHINE_AUTH_CONFIG,
     TAG_FILES_DIR,
+    get_machine_config,
 )
 from db import transaction
 
@@ -62,7 +61,7 @@ def load_tag_files(conn: sqlite3.Connection, tag_files_dir: Path = TAG_FILES_DIR
 
 def _ensure_default_machines(conn: sqlite3.Connection) -> None:
     for machine_name in DEFAULT_MACHINE_NAMES:
-        overrides = MACHINE_AUTH_CONFIG.get(machine_name, {})
+        resolved = get_machine_config(machine_name)
         conn.execute(
             """
             INSERT INTO machines (machine_name, endpoint_url, auth_mode, enabled, created_at)
@@ -74,9 +73,9 @@ def _ensure_default_machines(conn: sqlite3.Connection) -> None:
             """,
             (
                 machine_name,
-                overrides.get("endpoint_url"),
-                overrides.get("auth_mode", AUTH_MODE_ANONYMOUS),
-                1 if overrides.get("enabled", True) else 0,
+                resolved.get("endpoint_url"),
+                resolved.get("auth_mode", AUTH_MODE_ANONYMOUS),
+                1 if resolved.get("enabled", True) else 0,
             ),
         )
 
@@ -110,10 +109,10 @@ def _import_csv_file(conn: sqlite3.Connection, csv_file: Path) -> list[MachineIm
 
 
 def _upsert_machine(conn: sqlite3.Connection, machine_name: str, endpoint_url: str | None) -> int:
-    overrides = MACHINE_AUTH_CONFIG.get(machine_name, {})
-    final_endpoint = overrides.get("endpoint_url") or endpoint_url
-    auth_mode = str(overrides.get("auth_mode", AUTH_MODE_ANONYMOUS))
-    enabled = 1 if overrides.get("enabled", True) else 0
+    resolved = get_machine_config(machine_name, endpoint_url)
+    final_endpoint = resolved.get("endpoint_url")
+    auth_mode = str(resolved.get("auth_mode", AUTH_MODE_ANONYMOUS))
+    enabled = 1 if resolved.get("enabled", True) else 0
 
     conn.execute(
         """

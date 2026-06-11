@@ -23,6 +23,12 @@ On Windows, run the commands from `cmd.exe` or PowerShell with your virtual envi
 python run_collector.py --init-only
 ```
 
+## Show Config
+
+```bash
+python run_collector.py --show-config
+```
+
 ## Run One Poll Cycle
 
 ```bash
@@ -37,6 +43,8 @@ python run_collector.py
 
 The collector connects to each enabled machine once per poll cycle, reads that machine's enabled tags, inserts results into SQLite, disconnects cleanly, then sleeps until the next interval boundary. Stop it with `Ctrl+C`.
 
+By default only one collector instance is allowed at a time to prevent duplicate inserts. Use `--allow-multiple` only if duplicate polling is intentional.
+
 ## CSV Location
 
 Place the OPC UA discovery CSV files in `Tag_Files/` with names matching `*_opcua_discovered_tags.csv`.
@@ -45,8 +53,16 @@ Place the OPC UA discovery CSV files in `Tag_Files/` with names matching `*_opcu
 
 Per-machine auth and endpoint overrides live in `config.py` under `MACHINE_AUTH_CONFIG`.
 
-- `Pinch 20` is configured for the patched blank-password username token flow.
-- `Pinch 16`, `Pinch 17`, `Pinch 18`, `Pinch 19`, and `Pinch 21` default to anonymous auth with `SecurityPolicy None`.
+- `Pinch 16`, `Pinch 17`, `Pinch 18`, `Pinch 19`, and `Pinch 21` use anonymous auth.
+- `Pinch 20` uses the patched blank-password username token flow with:
+  - endpoint `opc.tcp://192.168.11.26:4840`
+  - channel `SecurityPolicy None`
+  - blank `security_string`
+  - username `OpcUaViewer`
+  - blank password `''`
+  - user token `PolicyId='3'`
+  - user token policy URI `http://opcfoundation.org/UA/SecurityPolicy#Basic256`
+- No client cert/key files are required for `Pinch 20`.
 - If `endpoint_url` is left as `None`, the importer uses the endpoint from the CSV.
 
 ## Database Notes
@@ -57,7 +73,11 @@ SQLite is configured with:
 - `PRAGMA synchronous=NORMAL`
 - `PRAGMA busy_timeout=5000`
 
-The schema includes `machines`, `tags`, `tag_samples`, and `poll_runs`, plus indexes for common time-series queries.
+The schema includes `machines`, `tags`, `tag_samples`, `poll_runs`, and `machine_poll_runs`, plus indexes for common time-series queries.
+
+Keep the SQLite database on local disk. WAL mode should not be used from a network share.
+
+At about `3833` samples per minute, this collector produces roughly `5.52 million` samples per day. SQLite is acceptable for local/test retention windows, but PostgreSQL or MySQL is the better next stage for longer retention or higher sustained history volume.
 
 ## Collector Dashboard
 
@@ -68,6 +88,12 @@ pip install -r requirements.txt
 python run_collector.py --init-only
 python run_collector.py
 python dashboard_app.py --host 0.0.0.0 --port 5050
+```
+
+For a production-ish local VM deployment, prefer Waitress:
+
+```bash
+python dashboard_app.py --host 0.0.0.0 --port 5050 --waitress
 ```
 
 Then open:
@@ -87,6 +113,7 @@ The dashboard includes maintenance buttons for running retention cleanup and cle
 - `Run cleanup now` calls the same retention cleanup used by the collector.
 - `Clear poll runs`, `Clear bad samples`, and `Clear monitoring data` require confirmation in the browser.
 - These dashboard maintenance actions do not delete `machines` or `tags`.
+- The Flask dev server is fine for local testing; Waitress is preferred if the dashboard stays running on the VM.
 
 ## Data Retention And Cleanup
 
@@ -108,7 +135,19 @@ python run_collector.py --clear-bad-samples --yes
 python run_collector.py --clear-monitoring-data --yes
 ```
 
+## DB Health Tools
+
+```bash
+python run_collector.py --db-stats
+python run_collector.py --checkpoint-db
+python run_collector.py --checkpoint-db --truncate
+python smoke_checks.py
+```
+
+- `--db-stats` shows current size plus growth/retention math.
+- `--checkpoint-db` runs `PRAGMA wal_checkpoint(PASSIVE)`.
+- `--checkpoint-db --truncate` runs `PRAGMA wal_checkpoint(TRUNCATE)` and is best used while the collector is stopped.
+
 ## Future Migration
 
 To migrate later to PostgreSQL or MySQL, keep the same logical schema and replace the small SQLite access layer in `db.py` plus the SQL connection setup. The importer and collector logic are already separated from transport details, so the main change would be swapping the DB driver and adapting SQL parameter style or upsert syntax.
-# pinch16_21_Add

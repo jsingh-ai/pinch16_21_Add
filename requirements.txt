@@ -2,3 +2,5 @@ opcua
 cryptography
 lxml
 Flask
+filelock
+waitress

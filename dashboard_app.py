@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 import logging
+import sys
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request
 
-from config import SQLITE_DB_PATH
+from config import LOGS_DIR, SQLITE_DB_PATH
 from dashboard_queries import get_dashboard_status
 from db import (
     cleanup_old_data,
@@ -24,7 +26,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", default="127.0.0.1", help="Host interface to bind")
     parser.add_argument("--port", default=5050, type=int, help="Port to listen on")
     parser.add_argument("--db", default=str(SQLITE_DB_PATH), help="Path to SQLite database")
+    parser.add_argument("--waitress", action="store_true", help="Serve with Waitress instead of Flask dev server")
     return parser
+
+
+def configure_logging() -> None:
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    root_logger.handlers.clear()
+
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
+    file_handler = RotatingFileHandler(
+        LOGS_DIR / "dashboard.log",
+        maxBytes=10 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(formatter)
+    root_logger.addHandler(console_handler)
+    root_logger.addHandler(file_handler)
 
 
 def create_app(db_path: str) -> Flask:
@@ -82,8 +105,17 @@ def _confirmed_action(db_path: str, action_name: str, action_func):
 
 
 def main() -> int:
+    configure_logging()
     args = build_arg_parser().parse_args()
     app = create_app(args.db)
+    if args.waitress:
+        try:
+            from waitress import serve
+        except ImportError:
+            print("Waitress is not installed. Run: pip install -r requirements.txt")
+            return 2
+        serve(app, host=args.host, port=args.port)
+        return 0
     app.run(host=args.host, port=args.port, debug=False)
     return 0
 

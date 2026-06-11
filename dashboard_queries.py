@@ -65,6 +65,14 @@ def tables_exist(conn: sqlite3.Connection) -> bool:
     return REQUIRED_TABLES.issubset(present)
 
 
+def table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
+        (table_name,),
+    ).fetchone()
+    return row is not None
+
+
 def get_dashboard_status(db_path: str) -> dict[str, Any]:
     db_file = Path(db_path)
     generated_at = utc_now()
@@ -120,7 +128,12 @@ def get_dashboard_status(db_path: str) -> dict[str, Any]:
         recent_cutoff_utc = (generated_at - timedelta(seconds=RECENT_WINDOW_SECONDS)).replace(microsecond=0)
         recent_cutoff_iso = recent_cutoff_utc.isoformat()
         recent_sample_totals = get_recent_sample_totals(conn, recent_cutoff_iso)
-        machines = get_machine_status_rows(conn, generated_at, recent_cutoff_iso)
+        machines = get_machine_status_rows(
+            conn,
+            generated_at,
+            recent_cutoff_iso,
+            use_machine_poll_runs=table_exists(conn, "machine_poll_runs"),
+        )
         recent_polls = get_recent_poll_runs(conn, generated_at)
         recent_errors = get_recent_errors(conn, generated_at)
 
@@ -233,9 +246,10 @@ def get_machine_status_rows(
     conn: sqlite3.Connection,
     now_utc: datetime,
     recent_cutoff_iso: str,
+    use_machine_poll_runs: bool,
 ) -> list[dict[str, Any]]:
     rows = conn.execute(
-        """
+        f"""
         WITH enabled_machines AS (
             SELECT id, machine_name, endpoint_url
             FROM machines
@@ -278,6 +292,21 @@ def get_machine_status_rows(
                 ) AS rn
             FROM tag_samples ts
             WHERE ts.quality = 'bad' AND ts.error_text IS NOT NULL AND ts.error_text <> ''
+        ),
+        latest_machine_poll_runs AS (
+            SELECT
+                mpr.machine_id,
+                mpr.finished_at_utc,
+                mpr.tags_attempted,
+                mpr.tags_ok,
+                mpr.tags_failed,
+                mpr.connection_ok,
+                mpr.error_text,
+                ROW_NUMBER() OVER (
+                    PARTITION BY mpr.machine_id
+                    ORDER BY COALESCE(mpr.finished_at_utc, mpr.started_at_utc) DESC, mpr.id DESC
+                ) AS rn
+            FROM machine_poll_runs mpr
         )
         SELECT
             m.id,
@@ -289,13 +318,19 @@ def get_machine_status_rows(
             COALESCE(rc.recent_good_samples, 0) AS recent_good_samples,
             COALESCE(rc.recent_bad_samples, 0) AS recent_bad_samples,
             COALESCE(rc.recent_total_samples, 0) AS recent_total_samples,
-            rec.error_text AS top_recent_error
+            rec.error_text AS top_recent_error,
+            { "mpr.finished_at_utc AS last_machine_poll_finished_at_utc," if use_machine_poll_runs else "NULL AS last_machine_poll_finished_at_utc," }
+            { "mpr.tags_attempted AS last_poll_attempted_tags," if use_machine_poll_runs else "NULL AS last_poll_attempted_tags," }
+            { "mpr.tags_failed AS last_poll_failed_tags," if use_machine_poll_runs else "NULL AS last_poll_failed_tags," }
+            { "mpr.connection_ok AS last_poll_connection_ok," if use_machine_poll_runs else "NULL AS last_poll_connection_ok," }
+            { "mpr.error_text AS last_poll_error_text" if use_machine_poll_runs else "NULL AS last_poll_error_text" }
         FROM enabled_machines m
         LEFT JOIN enabled_tags t ON t.machine_id = m.id
         LEFT JOIN latest_samples ls ON ls.machine_id = m.id
         LEFT JOIN latest_good_samples lgs ON lgs.machine_id = m.id
         LEFT JOIN recent_counts rc ON rc.machine_id = m.id
         LEFT JOIN recent_error_candidates rec ON rec.machine_id = m.id AND rec.rn = 1
+        { "LEFT JOIN latest_machine_poll_runs mpr ON mpr.machine_id = m.id AND mpr.rn = 1" if use_machine_poll_runs else "" }
         ORDER BY m.machine_name
         """,
         (recent_cutoff_iso, recent_cutoff_iso, recent_cutoff_iso),
@@ -314,6 +349,8 @@ def get_machine_status_rows(
             recent_good_samples=recent_good,
             recent_bad_samples=recent_bad,
             recent_success_rate=success_rate,
+            last_poll_connection_ok=row["last_poll_connection_ok"],
+            last_poll_error_text=row["last_poll_error_text"],
         )
         machine_rows.append(
             {
@@ -330,9 +367,9 @@ def get_machine_status_rows(
                 "recent_bad_samples": recent_bad,
                 "recent_total_samples": recent_total,
                 "recent_success_rate": success_rate,
-                "last_poll_attempted_tags": int(row["enabled_tags"] or 0),
-                "last_poll_failed_tags": recent_bad,
-                "top_recent_error": row["top_recent_error"],
+                "last_poll_attempted_tags": int(row["last_poll_attempted_tags"] or row["enabled_tags"] or 0),
+                "last_poll_failed_tags": int(row["last_poll_failed_tags"] or 0),
+                "top_recent_error": row["last_poll_error_text"] or row["top_recent_error"],
                 "last_updated_display": row["latest_sample_utc"] or "Never",
             }
         )
@@ -344,7 +381,11 @@ def determine_machine_status(
     recent_good_samples: int,
     recent_bad_samples: int,
     recent_success_rate: float,
+    last_poll_connection_ok: int | None,
+    last_poll_error_text: str | None,
 ) -> tuple[str, str]:
+    if last_poll_connection_ok == 0:
+        return ("CRITICAL", last_poll_error_text or "Latest machine poll could not connect.")
     if latest_good_age_seconds is None or recent_good_samples == 0:
         return ("CRITICAL", "No recent successful data.")
     if latest_good_age_seconds > STALE_THRESHOLD_SECONDS:
