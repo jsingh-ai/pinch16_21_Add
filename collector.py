@@ -234,7 +234,11 @@ def poll_machine(conn: sqlite3.Connection, machine: MachineRecord, started_ts: s
             client.disconnect()
             LOGGER.info("Machine disconnected %s", machine.machine_name)
         except Exception as exc:
-            LOGGER.warning("Disconnect failed for %s: %s", machine.machine_name, exc)
+            error_text = str(exc)
+            if "10038" in error_text:
+                LOGGER.debug("Disconnect skipped for %s after failed connect/auth", machine.machine_name)
+            else:
+                LOGGER.warning("Disconnect failed for %s: %s", machine.machine_name, exc)
 
     with transaction(conn):
         conn.executemany(

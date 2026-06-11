@@ -17,7 +17,7 @@ def patch_blank_basic256_username_token(
     client.set_user(username)
     client.set_password(password)
 
-    def _add_user_auth(self: Any, params: Any, server_nonce: bytes) -> None:
+    def _add_user_auth(self: Any, params: Any, *args: Any) -> None:
         params.UserIdentityToken.PolicyId = policy_id
         params.UserIdentityToken.UserName = username
         blank_password = password.encode("utf-8")
