@@ -73,6 +73,7 @@ MYSQL_DATABASE=press_opcua_collector
 MYSQL_SSL_CA=                optional MySQL CA file
 POLL_INTERVAL_MINUTES=1      time between poll starts
 OPCUA_READ_BATCH_SIZE=100    tags per OPC UA batch read
+MYSQL_INSERT_BATCH_SIZE=2000 maximum rows per MySQL batch insert
 PRESS_14_ENDPOINT_URL=       optional override of the Press 14 CSV endpoint
 PRESS_15_ENDPOINT_URL=       optional override of the Press 15 CSV endpoint
 ```
@@ -156,6 +157,20 @@ python run_collector.py --interval-minutes 5
 ```
 
 Polling cycles do not overlap. A Press-specific lock prevents two collector processes from running simultaneously. Logs are written to `logs/press_opcua_collector.log`. Database timestamps are stored in UTC.
+
+Continuous mode writes one summary line after each cycle with the elapsed time and
+good/bad counts for each press. It does not print every non-good tag. Use `--once`
+when you want the verbose individual tag list for troubleshooting.
+
+The collector uses batched OPC UA reads and batched MySQL inserts. Insert batches are
+bounded by `MYSQL_INSERT_BATCH_SIZE`, and the MySQL connection is checked/reconnected
+before each cycle. Per-cycle value/result lists are released after the cycle; they do
+not accumulate in Python memory. Rotating logs prevent unlimited log-file growth.
+
+At 2,024 tags per minute, the database receives about 2.9 million sample rows per day.
+Database storage growth—not collector process memory—is the main long-term capacity
+concern. Use `clear_collector_data.py` while testing. Before production, choose an
+explicit retention/archive policy rather than silently deleting historical data.
 
 ## Updating CSV files
 

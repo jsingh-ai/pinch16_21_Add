@@ -102,7 +102,9 @@ def configure_logging() -> None:
     root.setLevel(logging.INFO)
     root.addHandler(console)
     root.addHandler(file_handler)
-    logging.getLogger("opcua").setLevel(logging.WARNING)
+    # Collector messages retain useful read failures; suppress noisy library
+    # warnings such as the harmless secure-channel timeout negotiation.
+    logging.getLogger("opcua").setLevel(logging.ERROR)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -444,8 +446,14 @@ def save_results(connection, machine: RuntimeMachine, sampled_at: datetime, resu
         )
 
 
-def poll_machine(connection, machine: RuntimeMachine, sampled_at: datetime) -> None:
-    LOGGER.info("Polling %s (%s tags)", machine.machine_name, len(machine.tags))
+def poll_machine(
+    connection,
+    machine: RuntimeMachine,
+    sampled_at: datetime,
+    verbose: bool = True,
+) -> tuple[int, int]:
+    if verbose:
+        LOGGER.info("Polling %s (%s tags)", machine.machine_name, len(machine.tags))
     client = Client(machine.endpoint_url, timeout=10)
     client.session_timeout = 60000
     try:
@@ -464,33 +472,58 @@ def poll_machine(connection, machine: RuntimeMachine, sampled_at: datetime) -> N
         except Exception:
             pass
     save_results(connection, machine, sampled_at, results)
-    failed_results = [
-        result for result in results if result.error or not is_good_status(result.status_code)
-    ]
-    for result in failed_results:
-        LOGGER.warning(
-            "%s failed tag name=%s node_id=%s status=%s error=%s",
-            machine.machine_name,
-            result.tag.display_name or "<unnamed>",
-            result.tag.node_id,
-            result.status_code,
-            result.error or f"OPC UA status {result.status_code or 'unknown'}",
-        )
-    LOGGER.info(
-        "%s complete: saved=%s failed=%s",
-        machine.machine_name,
-        len(results),
-        len(failed_results),
+    bad_count = sum(
+        1 for result in results if result.error or not is_good_status(result.status_code)
     )
+    if verbose:
+        for result in results:
+            if result.error is None and is_good_status(result.status_code):
+                continue
+            LOGGER.warning(
+                "%s failed tag name=%s node_id=%s status=%s error=%s",
+                machine.machine_name,
+                result.tag.display_name or "<unnamed>",
+                result.tag.node_id,
+                result.status_code,
+                result.error or f"OPC UA status {result.status_code or 'unknown'}",
+            )
+    good_count = len(results) - bad_count
+    return good_count, bad_count
 
 
-def poll_all(connection, machines: tuple[RuntimeMachine, ...]) -> None:
+def poll_all(
+    connection,
+    machines: tuple[RuntimeMachine, ...],
+    verbose: bool = True,
+) -> None:
+    cycle_started = time.monotonic()
+    ping = getattr(connection, "ping", None)
+    if callable(ping):
+        ping(reconnect=True)
     sampled_at = utc_now()
+    summaries: list[str] = []
+    total_good = 0
+    total_bad = 0
     for machine in machines:
         try:
-            poll_machine(connection, machine, sampled_at)
+            good_count, bad_count = poll_machine(
+                connection, machine, sampled_at, verbose=verbose
+            )
         except Exception as exc:
             LOGGER.exception("Could not save %s results: %s", machine.machine_name, exc)
+            good_count = 0
+            bad_count = len(machine.tags)
+        total_good += good_count
+        total_bad += bad_count
+        summaries.append(f"{machine.machine_name} good={good_count} bad={bad_count}")
+    duration = time.monotonic() - cycle_started
+    LOGGER.info(
+        "Poll cycle finished in %.2fs: %s; total good=%s bad=%s",
+        duration,
+        "; ".join(summaries),
+        total_good,
+        total_bad,
+    )
 
 
 def run_loop(
@@ -502,11 +535,10 @@ def run_loop(
     interval_seconds = interval_minutes * 60.0
     while True:
         cycle_started = time.monotonic()
-        poll_all(connection, machines)
+        poll_all(connection, machines, verbose=once)
         if once:
             return
         delay = max(0.0, interval_seconds - (time.monotonic() - cycle_started))
-        LOGGER.info("Next poll in %.1f seconds", delay)
         time.sleep(delay)
 
 

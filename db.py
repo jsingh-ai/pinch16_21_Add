@@ -8,7 +8,7 @@ import pymysql
 from pymysql.connections import Connection
 from pymysql.cursors import DictCursor
 
-from config import mysql_connection_kwargs
+from config import MYSQL_INSERT_BATCH_SIZE, mysql_connection_kwargs
 
 
 SCHEMA_STATEMENTS = (
@@ -103,4 +103,6 @@ def transaction(connection: Connection) -> Iterator[Connection]:
 def execute_many(connection: Connection, sql: str, rows: list[tuple[object, ...]]) -> None:
     if rows:
         with connection.cursor() as cursor:
-            cursor.executemany(sql, rows)
+            batch_size = max(1, MYSQL_INSERT_BATCH_SIZE)
+            for offset in range(0, len(rows), batch_size):
+                cursor.executemany(sql, rows[offset : offset + batch_size])

@@ -236,7 +236,7 @@ class PollingTests(unittest.TestCase):
         )
         called: list[str] = []
 
-        def poll(connection, machine, sampled_at):
+        def poll(connection, machine, sampled_at, verbose=True):
             called.append(machine.machine_name)
             if machine.machine_name == "Press 14":
                 raise RuntimeError("offline")
@@ -275,6 +275,22 @@ class PollingTests(unittest.TestCase):
             ["Tag 1", "Tag 2", "Tag 3"],
         )
 
+    def test_continuous_style_poll_logs_summary_without_individual_tags(self) -> None:
+        tags = (
+            run_collector.RuntimeTag(1, 14, "node-1", "Tag 1"),
+            run_collector.RuntimeTag(2, 14, "node-2", "Tag 2"),
+        )
+        machine = run_collector.RuntimeMachine(14, "Press 14", "endpoint", tags)
+        with (
+            patch.object(run_collector, "poll_machine", return_value=(1, 1)),
+            patch.object(run_collector.LOGGER, "info") as info,
+            patch.object(run_collector.LOGGER, "warning") as warning,
+        ):
+            run_collector.poll_all(object(), (machine,), verbose=False)
+        warning.assert_not_called()
+        self.assertEqual(info.call_count, 1)
+        self.assertIn("Poll cycle finished", info.call_args.args[0])
+
 
 class CleanupTests(unittest.TestCase):
     def test_cleanup_deletes_samples_before_tags(self) -> None:
@@ -304,6 +320,27 @@ class CleanupTests(unittest.TestCase):
         deleted = clear_collector_data.clear_tag_data(Connection())
         self.assertEqual(statements, ["DELETE FROM tag_samples", "DELETE FROM tags"])
         self.assertEqual(deleted, (7, 3))
+
+
+class DatabaseBatchTests(unittest.TestCase):
+    def test_execute_many_splits_large_input_into_bounded_batches(self) -> None:
+        batches: list[list[tuple[object, ...]]] = []
+
+        class Cursor:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def executemany(self, sql, rows):
+                batches.append(list(rows))
+
+        connection = types.SimpleNamespace(cursor=lambda: Cursor())
+        rows = [(index,) for index in range(5)]
+        with patch.object(db, "MYSQL_INSERT_BATCH_SIZE", 2):
+            db.execute_many(connection, "INSERT", rows)
+        self.assertEqual([len(batch) for batch in batches], [2, 2, 1])
 
 
 if __name__ == "__main__":
