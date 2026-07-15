@@ -352,6 +352,11 @@ def read_tags(client: Any, tags: tuple[RuntimeTag, ...]) -> list[ReadResult]:
             except Exception as exc:
                 results.append(ReadResult(tag=tag, status_code="ReadError", error=str(exc)))
 
+        # Do not send an empty ReadRequest when every node ID in this chunk
+        # failed local parsing in client.get_node().
+        if not tag_nodes:
+            continue
+
         try:
             data_values = client.uaclient.get_attributes(
                 [node.nodeid for _, node in tag_nodes], ua.AttributeIds.Value
@@ -445,12 +450,22 @@ def poll_machine(connection, machine: RuntimeMachine, sampled_at: datetime) -> N
         except Exception:
             pass
     save_results(connection, machine, sampled_at, results)
-    failures = sum(1 for result in results if result.error or not is_good_status(result.status_code))
+    failed_results = [
+        result for result in results if result.error or not is_good_status(result.status_code)
+    ]
+    for result in failed_results[:5]:
+        LOGGER.warning(
+            "%s failed tag node_id=%s status=%s error=%s",
+            machine.machine_name,
+            result.tag.node_id,
+            result.status_code,
+            result.error or f"OPC UA status {result.status_code or 'unknown'}",
+        )
     LOGGER.info(
         "%s complete: saved=%s failed=%s",
         machine.machine_name,
         len(results),
-        failures,
+        len(failed_results),
     )
 
 

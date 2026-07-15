@@ -116,6 +116,27 @@ class CsvTests(unittest.TestCase):
 
 
 class PollingTests(unittest.TestCase):
+    def test_no_empty_batch_request_when_all_node_ids_are_invalid(self) -> None:
+        tags = (
+            run_collector.RuntimeTag(1, 14, "invalid-a", "A"),
+            run_collector.RuntimeTag(2, 14, "invalid-b", "B"),
+        )
+        batch_calls: list[object] = []
+
+        def invalid_node(node_id):
+            raise ValueError(f"cannot parse {node_id}")
+
+        client = types.SimpleNamespace(
+            get_node=invalid_node,
+            uaclient=types.SimpleNamespace(
+                get_attributes=lambda *args: batch_calls.append(args)
+            ),
+        )
+        results = run_collector.read_tags(client, tags)
+        self.assertEqual(batch_calls, [])
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(result.status_code == "ReadError" for result in results))
+
     def test_batch_read_returns_values(self) -> None:
         tags = (
             run_collector.RuntimeTag(1, 14, "a", "A"),
