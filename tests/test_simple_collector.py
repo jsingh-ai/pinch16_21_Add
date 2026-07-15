@@ -43,6 +43,7 @@ if "filelock" not in sys.modules:
     sys.modules["filelock"] = filelock
 
 import config
+import clear_collector_data
 import db
 import run_collector
 
@@ -246,6 +247,63 @@ class PollingTests(unittest.TestCase):
         ):
             run_collector.poll_all(object(), machines)
         self.assertEqual(called, ["Press 14", "Press 15"])
+
+    def test_every_failed_tag_name_is_logged(self) -> None:
+        tags = tuple(
+            run_collector.RuntimeTag(index, 14, f"node-{index}", f"Tag {index}")
+            for index in range(1, 4)
+        )
+        machine = run_collector.RuntimeMachine(14, "Press 14", "endpoint", tags)
+        results = [
+            run_collector.ReadResult(
+                tag=tag,
+                status_code="UncertainLastUsableValue",
+            )
+            for tag in tags
+        ]
+        with (
+            patch.object(run_collector, "Client") as client_class,
+            patch.object(run_collector, "read_tags", return_value=results),
+            patch.object(run_collector, "save_results"),
+            patch.object(run_collector.LOGGER, "warning") as warning,
+        ):
+            client_class.return_value.connect.return_value = None
+            run_collector.poll_machine(object(), machine, datetime.now(timezone.utc))
+        self.assertEqual(warning.call_count, 3)
+        self.assertEqual(
+            [call.args[2] for call in warning.call_args_list],
+            ["Tag 1", "Tag 2", "Tag 3"],
+        )
+
+
+class CleanupTests(unittest.TestCase):
+    def test_cleanup_deletes_samples_before_tags(self) -> None:
+        statements: list[str] = []
+
+        class Cursor:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def execute(self, statement):
+                statements.append(statement)
+                return 7 if statement == "DELETE FROM tag_samples" else 3
+
+        class Connection:
+            def cursor(self):
+                return Cursor()
+
+            def commit(self):
+                pass
+
+            def rollback(self):
+                pass
+
+        deleted = clear_collector_data.clear_tag_data(Connection())
+        self.assertEqual(statements, ["DELETE FROM tag_samples", "DELETE FROM tags"])
+        self.assertEqual(deleted, (7, 3))
 
 
 if __name__ == "__main__":

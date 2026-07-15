@@ -8,6 +8,7 @@ There is no dashboard, web server, cleanup process, statistics command, migratio
 
 ```text
 run_collector.py       collector, CSV reader, and command line
+clear_collector_data.py explicit tag/sample reset command
 config.py              .env settings
 db.py                  MySQL connection and table definitions
 .env.example           safe configuration template
@@ -168,6 +169,19 @@ sudo systemctl start press-opcua-collector
 ```
 
 The next start validates and synchronizes the CSVs before polling.
+
+## Clear test data before final use
+
+To permanently delete all collected samples and tag definitions while retaining the
+`machines` rows and table structure, stop the collector and run:
+
+```bash
+python clear_collector_data.py --yes
+```
+
+The `--yes` flag is required. The script deletes `tag_samples` first and then `tags`
+to preserve foreign-key integrity. The next collector start recreates tag definitions
+from both CSV files before polling. This command cannot be undone.
 
 ## Minimal systemd service
 

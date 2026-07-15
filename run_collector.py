@@ -467,10 +467,11 @@ def poll_machine(connection, machine: RuntimeMachine, sampled_at: datetime) -> N
     failed_results = [
         result for result in results if result.error or not is_good_status(result.status_code)
     ]
-    for result in failed_results[:5]:
+    for result in failed_results:
         LOGGER.warning(
-            "%s failed tag node_id=%s status=%s error=%s",
+            "%s failed tag name=%s node_id=%s status=%s error=%s",
             machine.machine_name,
+            result.tag.display_name or "<unnamed>",
             result.tag.node_id,
             result.status_code,
             result.error or f"OPC UA status {result.status_code or 'unknown'}",
