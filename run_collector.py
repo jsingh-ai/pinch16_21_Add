@@ -340,6 +340,20 @@ def read_one(tag: RuntimeTag, node: Any) -> ReadResult:
         return ReadResult(tag=tag, status_code="ReadError", error=str(exc))
 
 
+def get_node(client: Any, node_id: str) -> Any:
+    """Build string NodeIds directly so semicolons remain part of the identifier."""
+    if node_id.startswith("s="):
+        return client.get_node(ua.StringNodeId(node_id[2:], 0))
+
+    namespace_part, separator, identifier = node_id.partition(";s=")
+    if separator and namespace_part.startswith("ns="):
+        namespace_text = namespace_part[3:]
+        if namespace_text.isdigit():
+            return client.get_node(ua.StringNodeId(identifier, int(namespace_text)))
+
+    return client.get_node(node_id)
+
+
 def read_tags(client: Any, tags: tuple[RuntimeTag, ...]) -> list[ReadResult]:
     results: list[ReadResult] = []
     batch_size = max(1, OPCUA_READ_BATCH_SIZE)
@@ -348,7 +362,7 @@ def read_tags(client: Any, tags: tuple[RuntimeTag, ...]) -> list[ReadResult]:
         tag_nodes: list[tuple[RuntimeTag, Any]] = []
         for tag in chunk:
             try:
-                tag_nodes.append((tag, client.get_node(tag.node_id)))
+                tag_nodes.append((tag, get_node(client, tag.node_id)))
             except Exception as exc:
                 results.append(ReadResult(tag=tag, status_code="ReadError", error=str(exc)))
 

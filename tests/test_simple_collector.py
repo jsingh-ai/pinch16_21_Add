@@ -27,7 +27,13 @@ if "pymysql" not in sys.modules:
 if "opcua" not in sys.modules:
     opcua = types.ModuleType("opcua")
     opcua.Client = object
-    opcua.ua = types.SimpleNamespace(AttributeIds=types.SimpleNamespace(Value=13))
+    opcua.ua = types.SimpleNamespace(
+        AttributeIds=types.SimpleNamespace(Value=13),
+        StringNodeId=lambda identifier, namespace: types.SimpleNamespace(
+            Identifier=identifier,
+            NamespaceIndex=namespace,
+        ),
+    )
     sys.modules["opcua"] = opcua
 
 if "filelock" not in sys.modules:
@@ -71,6 +77,29 @@ class ConfigurationTests(unittest.TestCase):
 
 
 class CsvTests(unittest.TestCase):
+    def test_real_discovery_column_order_and_extra_fields_are_supported(self) -> None:
+        header = (
+            "machine_name,endpoint_url,opc_path,node_id,display_name,browse_name,"
+            "data_type,parent_branch,sample_value,discovered_at\n"
+        )
+        row = (
+            'Press 14,opc.tcp://press14.invalid:4843,'
+            '"Objects/EQ/Ink supply/Viscosity, setpoint [s]",'
+            'ns=2;s=/Objects/EQ/Ink supply/TCBox7;ViskoSollwert,'
+            '"Viscosity, setpoint [s]",TCBox7;ViskoSollwert,Float,Color deck 7,,'
+            '2026-07-15T11:39:07\n'
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "Press_14_opcua_discovered_tags.csv"
+            path.write_text(header + row, encoding="utf-8")
+            machine = run_collector.read_machine_csv(path, "Press 14")
+        self.assertEqual(len(machine.tags), 1)
+        self.assertEqual(
+            machine.tags[0].node_id,
+            "ns=2;s=/Objects/EQ/Ink supply/TCBox7;ViskoSollwert",
+        )
+        self.assertEqual(machine.tags[0].display_name, "Viscosity, setpoint [s]")
+
     def test_reads_both_press_csvs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             directory = Path(temp_dir)
@@ -116,6 +145,22 @@ class CsvTests(unittest.TestCase):
 
 
 class PollingTests(unittest.TestCase):
+    def test_string_node_id_preserves_semicolons_in_identifier(self) -> None:
+        received: list[object] = []
+        client = types.SimpleNamespace(
+            get_node=lambda node_id: received.append(node_id) or "node"
+        )
+        node = run_collector.get_node(
+            client,
+            "ns=2;s=/Objects/EQ65304/ProcessData/Farbwerk7;DynBeistellungRW",
+        )
+        self.assertEqual(node, "node")
+        self.assertEqual(received[0].NamespaceIndex, 2)
+        self.assertEqual(
+            received[0].Identifier,
+            "/Objects/EQ65304/ProcessData/Farbwerk7;DynBeistellungRW",
+        )
+
     def test_no_empty_batch_request_when_all_node_ids_are_invalid(self) -> None:
         tags = (
             run_collector.RuntimeTag(1, 14, "invalid-a", "A"),
