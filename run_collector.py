@@ -8,7 +8,21 @@ from logging.handlers import RotatingFileHandler
 from filelock import FileLock, Timeout
 
 from collector import build_arg_parser, collector_loop
-from config import COLLECTOR_LOCK_PATH, LOGS_DIR, get_all_machine_configs
+from config import (
+    COLLECTOR_LOCK_PATH,
+    COLLECTOR_LOG_PATH,
+    DASHBOARD_HOST,
+    DASHBOARD_PORT,
+    DEFAULT_OPCUA_READ_BATCH_SIZE,
+    MYSQL_DATABASE,
+    MYSQL_HOST,
+    MYSQL_PASSWORD,
+    MYSQL_PORT,
+    MYSQL_SSL_CA,
+    MYSQL_USER,
+    POLL_INTERVAL_SECONDS,
+    get_all_machine_configs,
+)
 from db import (
     cleanup_old_data,
     clear_all_samples,
@@ -25,7 +39,7 @@ LOGGER = logging.getLogger(__name__)
 
 
 def configure_logging() -> None:
-    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    COLLECTOR_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
     root_logger.handlers.clear()
@@ -34,7 +48,7 @@ def configure_logging() -> None:
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(formatter)
     file_handler = RotatingFileHandler(
-        LOGS_DIR / "collector.log",
+        COLLECTOR_LOG_PATH,
         maxBytes=10 * 1024 * 1024,
         backupCount=5,
         encoding="utf-8",
@@ -63,104 +77,97 @@ def requires_confirmation(args) -> bool:
 
 
 def show_config() -> int:
-    print(json.dumps(get_all_machine_configs(), indent=2, sort_keys=True))
+    resolved = {
+        "application": "Press 14–15 OPC UA Collector",
+        "mysql": {
+            "host": MYSQL_HOST,
+            "port": MYSQL_PORT,
+            "user": MYSQL_USER,
+            "database": MYSQL_DATABASE,
+            "password_configured": bool(MYSQL_PASSWORD),
+            "ssl_ca_configured": bool(MYSQL_SSL_CA),
+        },
+        "poll_interval_seconds": POLL_INTERVAL_SECONDS,
+        "opcua_read_batch_size": DEFAULT_OPCUA_READ_BATCH_SIZE,
+        "collector_lock_path": str(COLLECTOR_LOCK_PATH),
+        "collector_log_path": str(COLLECTOR_LOG_PATH),
+        "dashboard_host": DASHBOARD_HOST,
+        "dashboard_port": DASHBOARD_PORT,
+        "machines": get_all_machine_configs(redact_secrets=True),
+    }
+    print(json.dumps(resolved, indent=2, sort_keys=True))
     return 0
 
 
-def show_db_stats() -> int:
-    print(json.dumps(get_db_stats(), indent=2, sort_keys=True))
-    return 0
-
-
-def get_tag_count(conn) -> int:
-    with conn.cursor() as cursor:
-        cursor.execute("SELECT COUNT(*) AS count FROM tags")
-        row = cursor.fetchone()
-    return int(row["count"] or 0)
+def _print_sync_summaries(summaries) -> None:
+    for summary in summaries:
+        print(json.dumps(summary.as_dict(), sort_keys=True))
 
 
 def main() -> int:
-    configure_logging()
     parser = build_arg_parser()
     args = parser.parse_args()
+    configure_logging()
 
     if args.show_config:
         return show_config()
 
+    if requires_confirmation(args) and not args.yes:
+        print(f"Refusing destructive command without --yes.\nRetry with:\n{format_retry_command(sys.argv)}")
+        return 2
+
     conn = get_connection()
     try:
-        init_database(conn)
-
         if args.init_db:
-            LOGGER.info("Database schema initialization complete")
+            init_database(conn)
+            LOGGER.info("Database table initialization complete in %s", MYSQL_DATABASE)
             return 0
 
+        if args.sync_tags or args.init_only:
+            if args.init_only:
+                LOGGER.warning("--init-only is deprecated; use --sync-tags. It does not initialize tables.")
+            summaries = load_tag_files(conn)
+            _print_sync_summaries(summaries)
+            return 1 if any(summary.rejected for summary in summaries) else 0
+
         if args.db_stats:
-            return show_db_stats()
+            print(json.dumps(get_db_stats(conn=conn), indent=2, sort_keys=True))
+            return 0
 
         if args.cleanup_now:
             LOGGER.info("Cleanup finished: %s", cleanup_old_data(conn=conn))
             return 0
 
-        if requires_confirmation(args) and not args.yes:
-            print(f"Refusing destructive command without --yes.\nRetry with:\n{format_retry_command(sys.argv)}")
-            return 2
-
         if args.clear_poll_runs:
             LOGGER.warning("Cleared poll_runs deleted=%s", clear_poll_runs(conn=conn))
             return 0
-
         if args.clear_bad_samples:
             LOGGER.warning("Cleared bad tag_samples deleted=%s", clear_bad_samples(conn=conn))
             return 0
-
         if args.clear_all_samples:
             LOGGER.warning("Cleared all tag_samples deleted=%s", clear_all_samples(conn=conn))
             return 0
-
         if args.clear_monitoring_data:
             LOGGER.warning("Cleared monitoring data: %s", clear_monitoring_data(conn=conn))
             return 0
 
-        tag_count = get_tag_count(conn)
-        should_import_tags = args.init_only or tag_count == 0
-        if should_import_tags:
-            load_tag_files(conn)
-        else:
-            LOGGER.info(
-                "Skipping CSV tag import on startup because %s tags already exist in MySQL. Use --init-only when you want to resync tag definitions.",
-                tag_count,
-            )
-
-        if args.init_only:
-            LOGGER.info("Initialization complete; skipping polling due to --init-only")
-            return 0
-
-        if not args.allow_multiple:
-            lock = FileLock(COLLECTOR_LOCK_PATH)
-            try:
-                with lock.acquire(timeout=0):
-                    collector_loop(
-                        conn=conn,
-                        once=args.once,
-                        interval_seconds=args.interval_seconds,
-                        align_sleep=not args.no_sleep_align,
-                        machine_name=args.machine,
-                    )
-            except Timeout:
-                LOGGER.error("Another collector instance appears to be running. Use --allow-multiple only if duplicate polling is intentional.")
-                return 1
-        else:
-            collector_loop(
-                conn=conn,
-                once=args.once,
-                interval_seconds=args.interval_seconds,
-                align_sleep=not args.no_sleep_align,
-                machine_name=args.machine,
-            )
+        COLLECTOR_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        lock = FileLock(COLLECTOR_LOCK_PATH)
+        try:
+            with lock.acquire(timeout=0):
+                collector_loop(
+                    conn=conn,
+                    once=args.once,
+                    interval_seconds=args.interval_seconds,
+                    align_sleep=not args.no_sleep_align,
+                    machine_name=args.machine,
+                )
+        except Timeout:
+            LOGGER.error("Another Press collector instance is already running; polling was not started.")
+            return 1
         return 0
     except KeyboardInterrupt:
-        LOGGER.info("Collector stopped by user")
+        LOGGER.info("Press collector stopped by user")
         return 0
     finally:
         conn.close()

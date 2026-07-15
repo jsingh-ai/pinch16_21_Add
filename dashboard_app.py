@@ -7,7 +7,7 @@ from logging.handlers import RotatingFileHandler
 
 from flask import Flask, jsonify, render_template, request
 
-from config import LOGS_DIR
+from config import DASHBOARD_HOST, DASHBOARD_LOG_PATH, DASHBOARD_PORT
 from dashboard_queries import get_dashboard_status
 from db import cleanup_old_data, clear_bad_samples, clear_monitoring_data, clear_poll_runs, get_connection
 
@@ -15,15 +15,15 @@ LOGGER = logging.getLogger(__name__)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="OPC UA collector dashboard")
-    parser.add_argument("--host", default="127.0.0.1", help="Host interface to bind")
-    parser.add_argument("--port", default=5050, type=int, help="Port to listen on")
+    parser = argparse.ArgumentParser(description="Press 14–15 OPC UA Collector dashboard")
+    parser.add_argument("--host", default=DASHBOARD_HOST, help="Host interface to bind")
+    parser.add_argument("--port", default=DASHBOARD_PORT, type=int, help="Port to listen on")
     parser.add_argument("--waitress", action="store_true", help="Serve with Waitress instead of Flask dev server")
     return parser
 
 
 def configure_logging() -> None:
-    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    DASHBOARD_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
     root_logger.handlers.clear()
@@ -32,7 +32,7 @@ def configure_logging() -> None:
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(formatter)
     file_handler = RotatingFileHandler(
-        LOGS_DIR / "dashboard.log",
+        DASHBOARD_LOG_PATH,
         maxBytes=10 * 1024 * 1024,
         backupCount=5,
         encoding="utf-8",

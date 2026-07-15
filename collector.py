@@ -8,19 +8,20 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from opcua import Client
+from opcua import Client, ua
 
 from config import (
-    AUTH_MODE_USERNAME_BLANK_BASIC256_TOKEN,
+    AUTH_MODE_USERNAME_PASSWORD,
     CLEANUP_INTERVAL_MINUTES,
     DEFAULT_CONNECT_TIMEOUT_SECONDS,
-    DEFAULT_POLL_INTERVAL_SECONDS,
+    DEFAULT_MACHINE_NAMES,
+    DEFAULT_OPCUA_READ_BATCH_SIZE,
+    POLL_INTERVAL_SECONDS,
     DEFAULT_SESSION_TIMEOUT_MS,
     DEFAULT_TAG_FAILURE_LOG_SAMPLE,
     get_machine_config,
 )
 from db import Connection, cleanup_old_data, executemany, to_db_datetime, transaction, utc_now
-from opcua_auth import patch_blank_basic256_username_token
 
 LOGGER = logging.getLogger(__name__)
 
@@ -75,21 +76,30 @@ class PollRunStats:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="OPC UA tag collector")
-    parser.add_argument("--once", action="store_true", help="Run one poll cycle and exit")
-    parser.add_argument("--interval-seconds", type=int, default=DEFAULT_POLL_INTERVAL_SECONDS)
-    parser.add_argument("--no-sleep-align", action="store_true")
-    parser.add_argument("--init-db", action="store_true", help="Create MySQL tables and exit")
-    parser.add_argument("--init-only", action="store_true", help="Initialize DB and import tags without polling")
-    parser.add_argument("--machine", help="Poll only a specific machine_name")
-    parser.add_argument("--cleanup-now", action="store_true")
+    parser = argparse.ArgumentParser(description="Press 14–15 OPC UA Collector")
+    parser.add_argument("--once", action="store_true", help="Poll once and exit")
+    parser.add_argument(
+        "--interval-seconds",
+        type=int,
+        default=POLL_INTERVAL_SECONDS,
+        help="Polling interval (default: POLL_INTERVAL_SECONDS or 60)",
+    )
+    parser.add_argument("--no-sleep-align", action="store_true", help="Do not wait for an interval boundary")
+    parser.add_argument("--init-db", action="store_true", help="Create required tables in the selected database and exit")
+    parser.add_argument("--sync-tags", action="store_true", help="Validate and synchronize both Press CSV files, then exit")
+    parser.add_argument(
+        "--init-only",
+        action="store_true",
+        help="Deprecated alias for --sync-tags (does not create tables)",
+    )
+    parser.add_argument("--machine", choices=DEFAULT_MACHINE_NAMES, help="Poll only the selected press")
+    parser.add_argument("--cleanup-now", action="store_true", help="Run configured retention cleanup and exit")
     parser.add_argument("--clear-poll-runs", action="store_true")
     parser.add_argument("--clear-bad-samples", action="store_true")
     parser.add_argument("--clear-all-samples", action="store_true")
     parser.add_argument("--clear-monitoring-data", action="store_true")
-    parser.add_argument("--db-stats", action="store_true")
-    parser.add_argument("--show-config", action="store_true")
-    parser.add_argument("--allow-multiple", action="store_true")
+    parser.add_argument("--db-stats", action="store_true", help="Show database statistics and exit")
+    parser.add_argument("--show-config", action="store_true", help="Show resolved non-secret configuration and exit")
     parser.add_argument("--yes", action="store_true")
     return parser
 
@@ -161,23 +171,10 @@ def create_client(machine: MachineRecord) -> Client:
     client = Client(endpoint_url, timeout=DEFAULT_CONNECT_TIMEOUT_SECONDS)
     client.session_timeout = DEFAULT_SESSION_TIMEOUT_MS
 
-    application_uri = str(resolved.get("application_uri") or "").strip()
-    if application_uri:
-        client.application_uri = application_uri
-
-    if machine.auth_mode == AUTH_MODE_USERNAME_BLANK_BASIC256_TOKEN:
-        patch_blank_basic256_username_token(
-            client=client,
-            username=str(resolved.get("username", "")),
-            password=str(resolved.get("password", "")),
-            policy_id=str(resolved.get("username_token_policy_id", "3")),
-            policy_uri=str(
-                resolved.get(
-                    "username_token_policy_uri",
-                    "http://opcfoundation.org/UA/SecurityPolicy#Basic256",
-                )
-            ),
-        )
+    auth_mode = str(resolved["auth_mode"])
+    if auth_mode == AUTH_MODE_USERNAME_PASSWORD:
+        client.set_user(str(resolved.get("username", "")))
+        client.set_password(str(resolved.get("password", "")))
     return client
 
 
@@ -247,6 +244,62 @@ def read_node_sample(node: Any) -> tuple[Any, str | None, datetime | None, datet
         return (node.get_value(), None, None, None)
 
 
+def _sample_from_data_value(data_value: Any) -> tuple[Any, str | None, datetime | None, datetime | None]:
+    variant = getattr(data_value, "Value", None)
+    value = getattr(variant, "Value", None) if variant is not None else None
+    status_code = getattr(data_value, "StatusCode", None)
+    return (
+        value,
+        _format_status_code(status_code),
+        _normalize_utc_datetime(getattr(data_value, "SourceTimestamp", None)),
+        _normalize_utc_datetime(getattr(data_value, "ServerTimestamp", None)),
+    )
+
+
+def read_tag_batch(
+    client: Any,
+    tags: list[TagRecord],
+    batch_size: int = DEFAULT_OPCUA_READ_BATCH_SIZE,
+) -> list[tuple[TagRecord, Any, str | None, datetime | None, datetime | None, Exception | None]]:
+    """Read in OPC UA batches, falling back per tag if a server rejects a batch."""
+    results: list[tuple[TagRecord, Any, str | None, datetime | None, datetime | None, Exception | None]] = []
+    effective_batch_size = max(1, batch_size)
+    for offset in range(0, len(tags), effective_batch_size):
+        chunk = tags[offset : offset + effective_batch_size]
+        tag_nodes: list[tuple[TagRecord, Any]] = []
+        for tag in chunk:
+            try:
+                tag_nodes.append((tag, client.get_node(tag.node_id)))
+            except Exception as exc:
+                results.append((tag, None, None, None, None, exc))
+
+        batch_reader = getattr(getattr(client, "uaclient", None), "get_attributes", None)
+        if tag_nodes and callable(batch_reader):
+            try:
+                data_values = batch_reader(
+                    [getattr(node, "nodeid") for _, node in tag_nodes],
+                    ua.AttributeIds.Value,
+                )
+                if len(data_values) != len(tag_nodes):
+                    raise RuntimeError(
+                        f"OPC UA batch returned {len(data_values)} values for {len(tag_nodes)} tags"
+                    )
+                for (tag, _), data_value in zip(tag_nodes, data_values):
+                    value, status, source_ts, server_ts = _sample_from_data_value(data_value)
+                    results.append((tag, value, status, source_ts, server_ts, None))
+                continue
+            except Exception as exc:
+                LOGGER.warning("Batched OPC UA read failed; retrying tags individually: %s", exc)
+
+        for tag, node in tag_nodes:
+            try:
+                value, status, source_ts, server_ts = read_node_sample(node)
+                results.append((tag, value, status, source_ts, server_ts, None))
+            except Exception as exc:
+                results.append((tag, None, None, None, None, exc))
+    return results
+
+
 def poll_machine(conn: Connection, machine: MachineRecord, sampled_at_utc: datetime) -> MachinePollResult:
     machine_started = utc_now()
     tags = load_enabled_tags_for_machine(conn, machine.id)
@@ -280,10 +333,10 @@ def poll_machine(conn: Connection, machine: MachineRecord, sampled_at_utc: datet
         LOGGER.info("Machine connected %s", machine.machine_name)
         created_at = to_db_datetime(utc_now())
 
-        for tag in tags:
+        for tag, value, status_code, source_ts, server_ts, read_error in read_tag_batch(client, tags):
             try:
-                node = client.get_node(tag.node_id)
-                value, status_code, source_ts, server_ts = read_node_sample(node)
+                if read_error is not None:
+                    raise read_error
                 value_text, value_numeric = normalize_value(value)
                 is_good_status = _status_code_is_good(status_code)
                 quality = "good" if is_good_status is not False else "bad"
@@ -325,7 +378,7 @@ def poll_machine(conn: Connection, machine: MachineRecord, sampled_at_utc: datet
                         None,
                         None,
                         "bad",
-                        None,
+                        "ReadError",
                         str(exc),
                         created_at,
                     )
@@ -580,7 +633,8 @@ def collector_loop(
     align_sleep: bool,
     machine_name: str | None = None,
 ) -> None:
-    run_scheduled_cleanup(conn)
+    if not once:
+        run_scheduled_cleanup(conn)
     cleanup_interval_seconds = max(CLEANUP_INTERVAL_MINUTES, 1) * 60
     last_cleanup_monotonic = time.monotonic()
     while True:

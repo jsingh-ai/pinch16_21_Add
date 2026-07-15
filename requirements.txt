@@ -5,3 +5,4 @@ Flask
 filelock
 waitress
 PyMySQL
+python-dotenv
