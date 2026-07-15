@@ -1,8 +1,4 @@
-opcua
-cryptography
-lxml
-Flask
 filelock
-waitress
+opcua
 PyMySQL
 python-dotenv

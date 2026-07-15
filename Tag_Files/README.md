@@ -1,8 +1,8 @@
-# Press tag CSV directory
+# CSV files
 
-Before running tag synchronization, place the two real discovered-tag exports here:
+Place the two real files in this directory before running the collector:
 
 - `Press_14_opcua_discovered_tags.csv`
 - `Press_15_opcua_discovered_tags.csv`
 
-No production tag CSVs or fabricated OPC UA endpoints/node IDs are included in the repository.
+No production endpoints or node IDs are included in this repository.
